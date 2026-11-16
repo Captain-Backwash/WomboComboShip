@@ -1,0 +1,314 @@
+#include "BenGui.hpp"
+
+#include <spdlog/spdlog.h>
+#include <imgui.h>
+#include <imgui_internal.h>
+#include <libultraship/window/gui/GfxDebuggerWindow.h>
+#include "UIWidgets.hpp"
+#include "HudEditor.h"
+#include "2s2h/Enhancements/Audio/AudioEditor.h"
+#include "2s2h/Enhancements/ModMenu/ModMenu.h"
+#include "CosmeticEditor.h"
+#include "Notification.h"
+#include "2s2h/Rando/CheckTracker/CheckTracker.h"
+
+#ifdef __APPLE__
+#include <fast/backends/gfx_metal.h>
+#endif
+
+#ifdef __SWITCH__
+#include <port/switch/SwitchImpl.h>
+#endif
+
+#include "include/global.h"
+
+#include "Enhancements/Trackers/ItemTracker/ItemTracker.h"
+#include "Enhancements/Trackers/ItemTracker/ItemTrackerSettings.h"
+#include "Enhancements/Trackers/DisplayOverlay.h"
+#include "Enhancements/Trackers//TimeSplits/Timesplits.h"
+#include "Enhancements/Trackers/TimeSplits/TimesplitsSettings.h"
+#include "BenMenu.h"
+#include "BenMenuBar.h"
+#include "DeveloperTools/HookDebugger.h"
+#include "DeveloperTools/SaveEditor.h"
+#include "DeveloperTools/ActorViewer.h"
+#include "DeveloperTools/CollisionViewer.h"
+#include "DeveloperTools/EventLog.h"
+#include "DeveloperTools/DLViewer.h"
+#include "DeveloperTools/MessageViewer.h"
+
+// ComboShip: in the combo build, OOT (soh) registers identically-named tracker windows FIRST into
+// the single shared libultraship Gui. Gui::AddGuiWindow keys by display name and rejects duplicates,
+// so any MM window whose name matches an OOT one (trackers, plus dev tools like "Save Editor",
+// "Actor Viewer", "Audio Editor", "Mod Menu", "Input Viewer", "Modal Window") would be silently
+// dropped and never drawn — that is why MM's "Save Editor" used to show OOT's. Suffix the keys "##MM":
+// ImGui shows only the text before "##", so the visible title stays "Save Editor", but the map key
+// (and ImGui window ID) is unique and both games coexist. The popout WindowName() references in
+// BenMenu.cpp / 2s2h/Rando/Menu.cpp use the same suffix. The active-game gating in
+// combo/gui/ComboTrackerVisibility.cpp ensures the two games' trackers never draw at once.
+// See docs/UPSTREAM_MERGES.md.
+#ifdef COMBO_BUILD
+#define COMBO_MM_TRACKER_SUFFIX "##MM"
+#else
+#define COMBO_MM_TRACKER_SUFFIX ""
+#endif
+
+namespace BenGui {
+// MARK: - Delegates
+
+std::shared_ptr<BenMenuBar> mBenMenuBar;
+
+std::shared_ptr<Ship::GuiWindow> mConsoleWindow;
+std::shared_ptr<Ship::GuiWindow> mStatsWindow;
+std::shared_ptr<Ship::GuiWindow> mGfxDebuggerWindow;
+std::shared_ptr<Ship::GuiWindow> mInputEditorWindow;
+
+std::shared_ptr<HookDebuggerWindow> mHookDebuggerWindow;
+std::shared_ptr<SaveEditorWindow> mSaveEditorWindow;
+std::shared_ptr<HudEditorWindow> mHudEditorWindow;
+std::shared_ptr<CosmeticEditorWindow> mCosmeticEditorWindow;
+std::shared_ptr<ActorViewerWindow> mActorViewerWindow;
+std::shared_ptr<CollisionViewerWindow> mCollisionViewerWindow;
+std::shared_ptr<EventLogWindow> mEventLogWindow;
+std::shared_ptr<DLViewerWindow> mDLViewerWindow;
+std::shared_ptr<MessageViewerWindow> mMessageViewerWindow;
+std::shared_ptr<AudioEditor> mAudioEditorWindow;
+std::shared_ptr<ModMenuWindow> mModMenuWindow;
+std::shared_ptr<BenMenu> mBenMenu;
+std::shared_ptr<Notification::Window> mNotificationWindow;
+std::shared_ptr<Rando::CheckTracker::CheckTrackerWindow> mRandoCheckTrackerWindow;
+std::shared_ptr<Rando::CheckTracker::SettingsWindow> mRandoCheckTrackerSettingsWindow;
+std::shared_ptr<ItemTrackerWindow> mItemTrackerWindow;
+std::shared_ptr<ItemTrackerSettingsWindow> mItemTrackerSettingsWindow;
+std::shared_ptr<DisplayOverlayWindow> mDisplayOverlayWindow;
+std::shared_ptr<TimesplitsWindow> mTimesplitsWindow;
+std::shared_ptr<TimesplitsSettingsWindow> mTimesplitsSettingsWindow;
+std::shared_ptr<InputViewer> mInputViewer;
+std::shared_ptr<InputViewerSettingsWindow> mInputViewerSettings;
+std::shared_ptr<BenModalWindow> mModalWindow;
+
+UIWidgets::Colors GetMenuThemeColor() {
+    return mBenMenu->GetMenuThemeColor();
+}
+
+std::shared_ptr<BenMenu> GetBenMenu() {
+    return mBenMenu;
+} // ComboShip
+
+void SetupMenu() {
+    auto gui = Ship::Context::GetRawInstance()->GetWindow()->GetGui();
+    mBenMenu = std::make_shared<BenMenu>("gWindows.Menu", "Settings Menu");
+#ifndef COMBO_BUILD
+    gui->SetMenu(mBenMenu); // ComboShip: comboui owns the menu; MM only builds its tree.
+#endif
+
+    auto& style = ImGui::GetStyle();
+    style.FramePadding = ImVec2(4.0f, 6.0f);
+    style.ItemSpacing = ImVec2(8.0f, 6.0f);
+    style.Colors[ImGuiCol_MenuBarBg] = UIWidgets::ColorValues.at(UIWidgets::Colors::DarkGray);
+
+    // ComboShip: OOT registers "Modal Window" first, so an unsuffixed MM one is rejected and never
+    // drawn — every BenGui::RegisterPopup would queue a popup nothing can show or dismiss.
+    mModalWindow = std::make_shared<BenModalWindow>("gWindows.ModalWindow", "Modal Window" COMBO_MM_TRACKER_SUFFIX);
+    gui->AddGuiWindow(mModalWindow);
+    mModalWindow->Show();
+}
+
+// ComboShip: install MM's menu into the shared Gui's single menu slot. On the combo transition the
+// ctor's SetupMenu() is skipped, so the slot otherwise keeps OOT's SohMenu. First call constructs
+// BenMenu; later calls re-set it.
+void ActivateMenu() {
+#ifdef COMBO_BUILD
+    // ComboShip: comboui owns the single Gui menu slot, so we never gui->SetMenu here — but mBenMenu
+    // must still be built (widgets populate via BenMenu::InitElement) so MM_ExportMenu / MM_MenuDrawCustom
+    // can walk it for the MM tab. SetupMenu's own gui->SetMenu is guarded out, so calling it here only
+    // constructs the menu. Without this, mBenMenu stays null in combo and the MM tab is empty.
+    if (mBenMenu == nullptr) {
+        SetupMenu();
+    }
+#else
+    auto gui = Ship::Context::GetRawInstance()->GetWindow()->GetGui();
+    if (mBenMenu == nullptr) {
+        SetupMenu();
+    } else {
+        gui->SetMenu(mBenMenu);
+    }
+#endif
+}
+
+void SetupGuiElements() {
+    auto gui = Ship::Context::GetRawInstance()->GetWindow()->GetGui();
+
+    mStatsWindow = gui->GetGuiWindow("Stats");
+    if (mStatsWindow == nullptr) {
+        SPDLOG_ERROR("Could not find stats window");
+    }
+
+    mConsoleWindow = gui->GetGuiWindow("Console");
+    if (mConsoleWindow == nullptr) {
+        SPDLOG_ERROR("Could not find console window");
+    }
+
+    mGfxDebuggerWindow =
+        std::make_shared<LUS::GfxDebuggerWindow>("gOpenWindows.GfxDebugger", "Gfx Debugger", ImVec2(520, 600));
+    gui->AddGuiWindow(mGfxDebuggerWindow);
+
+    mInputEditorWindow = gui->GetGuiWindow("2S2H Input Editor");
+    if (mInputEditorWindow == nullptr) {
+        SPDLOG_ERROR("Could not find input editor window");
+    }
+
+    mHookDebuggerWindow = std::make_shared<HookDebuggerWindow>(
+        "gWindows.HookDebugger", "Hook Debugger" COMBO_MM_TRACKER_SUFFIX, ImVec2(480, 600));
+    gui->AddGuiWindow(mHookDebuggerWindow);
+
+    mSaveEditorWindow = std::make_shared<SaveEditorWindow>("gWindows.SaveEditor", "Save Editor" COMBO_MM_TRACKER_SUFFIX,
+                                                           ImVec2(480, 600));
+    gui->AddGuiWindow(mSaveEditorWindow);
+
+    mHudEditorWindow = std::make_shared<HudEditorWindow>("gWindows.HudEditor", "HUD Editor", ImVec2(480, 600));
+    gui->AddGuiWindow(mHudEditorWindow);
+
+    mCosmeticEditorWindow =
+        std::make_shared<CosmeticEditorWindow>("gWindows.CosmeticEditor", "Cosmetic Editor", ImVec2(480, 600));
+    gui->AddGuiWindow(mCosmeticEditorWindow);
+
+    mActorViewerWindow = std::make_shared<ActorViewerWindow>("gWindows.ActorViewer",
+                                                             "Actor Viewer" COMBO_MM_TRACKER_SUFFIX, ImVec2(520, 600));
+    gui->AddGuiWindow(mActorViewerWindow);
+
+    mCollisionViewerWindow = std::make_shared<CollisionViewerWindow>(
+        "gWindows.CollisionViewer", "Collision Viewer" COMBO_MM_TRACKER_SUFFIX, ImVec2(390, 475));
+    gui->AddGuiWindow(mCollisionViewerWindow);
+
+    mEventLogWindow = std::make_shared<EventLogWindow>("gWindows.EventLog", "Event Log", ImVec2(520, 600));
+    gui->AddGuiWindow(mEventLogWindow);
+
+    mDLViewerWindow = std::make_shared<DLViewerWindow>("gWindows.DLViewer", "DL Viewer", ImVec2(520, 600));
+    gui->AddGuiWindow(mDLViewerWindow);
+    mMessageViewerWindow = std::make_shared<MessageViewerWindow>(
+        "gWindows.MessageViewer", "Message Viewer" COMBO_MM_TRACKER_SUFFIX, ImVec2(520, 600));
+    gui->AddGuiWindow(mMessageViewerWindow);
+
+    mAudioEditorWindow =
+        std::make_shared<AudioEditor>("gWindows.AudioEditor", "Audio Editor" COMBO_MM_TRACKER_SUFFIX, ImVec2(520, 600));
+    gui->AddGuiWindow(mAudioEditorWindow);
+
+    mModMenuWindow =
+        std::make_shared<ModMenuWindow>("gWindows.ModMenu", "Mod Menu" COMBO_MM_TRACKER_SUFFIX, ImVec2(820, 630));
+    gui->AddGuiWindow(mModMenuWindow);
+
+    mItemTrackerWindow =
+        std::make_shared<ItemTrackerWindow>("gWindows.ItemTracker", "Item Tracker" COMBO_MM_TRACKER_SUFFIX);
+    gui->AddGuiWindow(mItemTrackerWindow);
+
+    mItemTrackerSettingsWindow = std::make_shared<ItemTrackerSettingsWindow>(
+        "gWindows.ItemTrackerSettings", "Item Tracker Settings" COMBO_MM_TRACKER_SUFFIX, ImVec2(800, 400));
+    gui->AddGuiWindow(mItemTrackerSettingsWindow);
+
+    mDisplayOverlayWindow = std::make_shared<DisplayOverlayWindow>("gWindows.DisplayOverlay", "Display Overlay");
+    gui->AddGuiWindow(mDisplayOverlayWindow);
+
+    mTimesplitsWindow =
+        std::make_shared<TimesplitsWindow>("gWindows.Timesplits", "Time Splits Window" COMBO_MM_TRACKER_SUFFIX);
+    gui->AddGuiWindow(mTimesplitsWindow);
+
+#ifdef COMBO_BUILD
+    // ComboShip: "gWindows.Timesplits.Settings" is a subtree of the leaf above (breaks config save);
+    // use a sibling key and drop the old one so a stale copy can't clash either.
+    CVarClear("gWindows.Timesplits.Settings");
+    mTimesplitsSettingsWindow = std::make_shared<TimesplitsSettingsWindow>(
+        "gWindows.TimesplitsSettings", "Time Splits Settings Window" COMBO_MM_TRACKER_SUFFIX, ImVec2(567, 97));
+#else
+    mTimesplitsSettingsWindow = std::make_shared<TimesplitsSettingsWindow>(
+        "gWindows.Timesplits.Settings", "Time Splits Settings Window", ImVec2(567, 97));
+#endif
+    gui->AddGuiWindow(mTimesplitsSettingsWindow);
+
+    // ComboShip: suffix the registered name so MM's notification window does not collide with OOT's
+    // identically-named "Notifications Window" in the shared Gui (AddGuiWindow rejects duplicates,
+    // which would drop MM's window). comboui gates which one draws per active game. Standalone =
+    // empty suffix (unchanged). See combo/gui/ComboTrackerVisibility.cpp + docs/UPSTREAM_MERGES.md.
+    mNotificationWindow = std::make_shared<Notification::Window>("gWindows.Notifications",
+                                                                 "Notifications Window" COMBO_MM_TRACKER_SUFFIX);
+    gui->AddGuiWindow(mNotificationWindow);
+    mNotificationWindow->Show();
+
+    mRandoCheckTrackerWindow = std::make_shared<Rando::CheckTracker::CheckTrackerWindow>(
+        "gWindows.CheckTracker", "Check Tracker" COMBO_MM_TRACKER_SUFFIX, ImVec2(375, 460));
+    gui->AddGuiWindow(mRandoCheckTrackerWindow);
+
+    mRandoCheckTrackerSettingsWindow = std::make_shared<Rando::CheckTracker::SettingsWindow>(
+        "gWindows.CheckTrackerSettings", "Check Tracker Settings" COMBO_MM_TRACKER_SUFFIX);
+    gui->AddGuiWindow(mRandoCheckTrackerSettingsWindow);
+
+    mInputViewer = std::make_shared<InputViewer>("gWindows.InputViewer", "Input Viewer" COMBO_MM_TRACKER_SUFFIX);
+    gui->AddGuiWindow(mInputViewer);
+    mInputViewerSettings = std::make_shared<InputViewerSettingsWindow>(
+        "gWindows.InputViewerSettings", "Input Viewer Settings" COMBO_MM_TRACKER_SUFFIX, ImVec2(500, 525));
+    gui->AddGuiWindow(mInputViewerSettings);
+}
+
+void Destroy() {
+    auto gui = Ship::Context::GetRawInstance()->GetWindow()->GetGui();
+
+    gui->RemoveAllGuiWindows();
+    mBenMenuBar = nullptr;
+    mBenMenu = nullptr;
+    mModalWindow = nullptr;
+    mStatsWindow = nullptr;
+    mConsoleWindow = nullptr;
+    mGfxDebuggerWindow = nullptr;
+    mInputEditorWindow = nullptr;
+    mCollisionViewerWindow = nullptr;
+    mEventLogWindow = nullptr;
+    mNotificationWindow = nullptr;
+    mRandoCheckTrackerWindow = nullptr;
+    mRandoCheckTrackerSettingsWindow = nullptr;
+
+    mHookDebuggerWindow = nullptr;
+    mSaveEditorWindow = nullptr;
+    mHudEditorWindow = nullptr;
+    mCosmeticEditorWindow = nullptr;
+    mActorViewerWindow = nullptr;
+    mDLViewerWindow = nullptr;
+    mMessageViewerWindow = nullptr;
+    mAudioEditorWindow = nullptr;
+    mModMenuWindow = nullptr;
+    mItemTrackerWindow = nullptr;
+    mItemTrackerSettingsWindow = nullptr;
+    mInputViewer = nullptr;
+    mInputViewerSettings = nullptr;
+}
+
+void RegisterPopup(std::string title, std::string message, std::string button1, std::string button2,
+                   std::function<void()> button1callback, std::function<void()> button2callback) {
+    mModalWindow->RegisterPopup(title, message, button1, button2, button1callback, button2callback);
+}
+
+size_t PopupsQueued() {
+    return mModalWindow->PopupsQueued();
+}
+
+bool DismissPopup(std::string title) {
+    if (mModalWindow->IsPopupOpen(title)) {
+        mModalWindow->DismissPopup();
+        return true;
+    }
+    return false;
+}
+
+void SetDisplayOverlayVisibility(bool visible) {
+    if (mDisplayOverlayWindow != nullptr) {
+        if (visible) {
+            mDisplayOverlayWindow->Show();
+        } else {
+            mDisplayOverlayWindow->Hide();
+        }
+    } else {
+        CVarSetInteger("gWindows.DisplayOverlay", visible ? 1 : 0);
+    }
+    Ship::Context::GetRawInstance()->GetWindow()->GetGui()->SaveConsoleVariablesNextFrame();
+}
+
+} // namespace BenGui

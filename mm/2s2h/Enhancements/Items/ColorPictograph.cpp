@@ -1,0 +1,292 @@
+#include <libultraship/bridge/consolevariablebridge.h>
+#include "2s2h/GameInteractor/GameInteractor.h"
+#include "2s2h/ShipInit.hpp"
+#include "2s2h/Enhancements/FrameInterpolation/FrameInterpolation.h"
+#include "2s2h/BenPort.h" // appShortName
+#include <fstream>
+#include <filesystem>
+#include <cstring>
+#include <png.h>
+
+using json = nlohmann::json;
+
+extern "C" {
+#include "variables.h"
+}
+
+#define CVAR_NAME "gEnhancements.Items.ColorPictograph"
+#define CVAR CVarGetInteger(CVAR_NAME, 0)
+
+static s16 fileNumber = 1;
+static u16 pictoPhotoRGBABuffer[PICTO_PHOTO_SIZE];
+
+static std::filesystem::path PictoDir() {
+#ifdef COMBO_BUILD
+    // ComboShip: photos live beside the merged save. Combo never creates the vendored "saves/" dir,
+    // because per-slot writes divert into the .combosav container before create_directories runs.
+    return Ship::Context::GetPathRelativeToAppDirectory("Save", appShortName);
+#else
+    return Ship::Context::GetPathRelativeToAppDirectory("saves", appShortName);
+#endif
+}
+
+static std::string PictoPath() {
+    return (PictoDir() / ("picto" + std::to_string(fileNumber) + ".png")).string();
+}
+
+void SavePictoPng() {
+    const int width = PICTO_PHOTO_WIDTH;
+    const int height = PICTO_PHOTO_HEIGHT;
+
+    std::error_code ec;
+    std::filesystem::create_directories(PictoDir(), ec);
+
+    std::string path = PictoPath();
+
+    FILE* fp = fopen(path.c_str(), "wb");
+    // A photo is cosmetic; throwing here unwinds out of the DLL into std::terminate.
+    if (!fp)
+        return;
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (!png) {
+        fclose(fp);
+        return;
+    }
+
+    png_infop info = png_create_info_struct(png);
+    if (!info) {
+        png_destroy_write_struct(&png, nullptr);
+        fclose(fp);
+        return;
+    }
+
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_write_struct(&png, &info);
+        fclose(fp);
+        return;
+    }
+
+    png_init_io(png, fp);
+
+    png_set_IHDR(png, info, width, height, 8, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_BASE,
+                 PNG_FILTER_TYPE_BASE);
+
+    png_write_info(png, info);
+
+    // RGBA8 buffer
+    std::vector<uint8_t> buffer(width * height * 4);
+
+    for (int i = 0; i < width * height; ++i) {
+        uint16_t px = pictoPhotoRGBABuffer[i];
+        px = (px >> 8) | (px << 8);
+        buffer[i * 4 + 0] = ((px >> 11) & 0x1F) << 3; // R
+        buffer[i * 4 + 1] = ((px >> 6) & 0x1F) << 3;  // G
+        buffer[i * 4 + 2] = ((px >> 1) & 0x1F) << 3;  // B
+        buffer[i * 4 + 3] = (px & 1) ? 255 : 0;       // A
+    }
+
+    std::vector<png_bytep> rows(height);
+    for (int y = 0; y < height; ++y)
+        rows[y] = &buffer[y * width * 4];
+
+    png_write_image(png, rows.data());
+    png_write_end(png, nullptr);
+
+    png_destroy_write_struct(&png, &info);
+    fclose(fp);
+}
+
+void LoadPictoPNG() {
+    std::string path = PictoPath();
+
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp) {
+        std::memset(pictoPhotoRGBABuffer, 0, sizeof(pictoPhotoRGBABuffer));
+        return;
+    }
+
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    png_infop info = png ? png_create_info_struct(png) : nullptr;
+
+    // A corrupt or wrong-size photo must not throw: it would unwind out of the DLL into std::terminate.
+    auto bail = [&]() {
+        if (png)
+            png_destroy_read_struct(&png, info ? &info : nullptr, nullptr);
+        fclose(fp);
+        std::memset(pictoPhotoRGBABuffer, 0, sizeof(pictoPhotoRGBABuffer));
+    };
+
+    if (!png || !info) {
+        bail();
+        return;
+    }
+
+    if (setjmp(png_jmpbuf(png))) {
+        bail();
+        return;
+    }
+
+    png_init_io(png, fp);
+    png_read_info(png, info);
+
+    png_uint_32 width, height;
+    int depth, color;
+    png_get_IHDR(png, info, &width, &height, &depth, &color, nullptr, nullptr, nullptr);
+
+    if (width != PICTO_PHOTO_WIDTH || height != PICTO_PHOTO_HEIGHT) {
+        bail();
+        return;
+    }
+
+    png_set_expand(png);
+    png_set_strip_16(png);
+    png_set_add_alpha(png, 0xFF, PNG_FILLER_AFTER);
+    png_read_update_info(png, info);
+
+    std::vector<uint8_t> buffer(width * height * 4);
+    std::vector<png_bytep> rows(height);
+
+    for (size_t y = 0; y < height; ++y)
+        rows[y] = &buffer[y * width * 4];
+
+    png_read_image(png, rows.data());
+
+    for (size_t i = 0; i < width * height; ++i) {
+        uint8_t r = buffer[i * 4 + 0] >> 3;
+        uint8_t g = buffer[i * 4 + 1] >> 3;
+        uint8_t b = buffer[i * 4 + 2] >> 3;
+        uint8_t a = buffer[i * 4 + 3] ? 1 : 0;
+        uint16_t px = (r << 11) | (g << 6) | (b << 1) | a;
+        pictoPhotoRGBABuffer[i] = (px >> 8) | (px << 8);
+    }
+
+    png_destroy_read_struct(&png, &info, nullptr);
+    fclose(fp);
+}
+
+void ConvertImage(u16* destI, u16* srcRgba16, s32 rgba16Width, s32 pixelLeft, s32 pixelTop, s32 pixelRight,
+                  s32 pixelBottom) {
+    for (int i = pixelTop; i <= pixelBottom; i++) {
+        for (int j = pixelLeft; j <= pixelRight; j++) {
+            u16 px = srcRgba16[i * rgba16Width + j];
+            px = (px >> 8) | (px << 8);
+            destI[(i - pixelTop) * PICTO_PHOTO_WIDTH + (j - pixelLeft)] = px;
+        }
+    }
+}
+
+void DrawPicto(s16 sp2CC) {
+
+    OPEN_DISPS(gPlayState->state.gfxCtx);
+
+    // Get rid of Sepia tone from prior gDPSetPrimColor call
+    gDPSetCombineMode(OVERLAY_DISP++, G_CC_DECALRGBA, G_CC_DECALRGBA);
+
+    gSPInvalidateTexCache(OVERLAY_DISP++, (uintptr_t)(pictoPhotoRGBABuffer) + (0xA00 * sp2CC));
+    gDPLoadTextureBlock(OVERLAY_DISP++, (u16*)(pictoPhotoRGBABuffer) + (0x500 * sp2CC), G_IM_FMT_RGBA, G_IM_SIZ_16b,
+                        PICTO_PHOTO_WIDTH, 8, 0, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK,
+                        G_TX_NOMASK, G_TX_NOLOD, G_TX_NOLOD);
+
+    CLOSE_DISPS(gPlayState->state.gfxCtx);
+}
+
+void RegisterColorPictograph() {
+    COND_VB_SHOULD(VB_PICTO_TAKE, true, {
+        PreRender* prerender = va_arg(args, PreRender*);
+        ConvertImage(pictoPhotoRGBABuffer, prerender->fbufSave, SCREEN_WIDTH, PICTO_PHOTO_TOPLEFT_X,
+                     PICTO_PHOTO_TOPLEFT_Y, (PICTO_PHOTO_TOPLEFT_X + PICTO_PHOTO_WIDTH) - 1,
+                     (PICTO_PHOTO_TOPLEFT_Y + PICTO_PHOTO_HEIGHT) - 1);
+
+        // Probably don't need to do this everytime, just on Save (specifically owl save)
+        SavePictoPng();
+    });
+
+    COND_VB_SHOULD(VB_PICTO_DISPLAY, CVAR, {
+        s16* sp2CC = va_arg(args, s16*);
+
+        // might need something better to check for existance
+        if (pictoPhotoRGBABuffer[0] != 0) {
+            DrawPicto(*sp2CC);
+            *should = false;
+        }
+    });
+
+    COND_HOOK(OnSaveLoad, true, [](s16 fileNum) { fileNumber = fileNum + 1; });
+
+    COND_VB_SHOULD(VB_PICTO_ACTIVATE, true, {
+        if (*should) {
+            LoadPictoPNG();
+        }
+    });
+}
+
+static RegisterShipInitFunc initFunc(RegisterColorPictograph, { CVAR_NAME });
+
+#ifdef COMBO_BUILD
+// ComboShip: MM's Pictograph Box used in Hyrule (OOT gameplay) — the OOT side is
+// soh/soh/Enhancements/randomizer/ComboPicto.cpp. The photo is MM's photo: these exports let the OOT port read and
+// write MM's resident save (pictoPhotoI5 + QUEST_PICTOGRAPH), so a photo taken in Hyrule is the one Termina shows and
+// vice versa, and run this file's VB_PICTO_TAKE / VB_PICTO_ACTIVATE / VB_PICTO_DISPLAY behaviour on MM's own buffer.
+#include "ComboExport.h"
+#include "interface/parameter_static/parameter_static.h"
+
+// gSaveContext.pictoPhotoI5 (PICTO_PHOTO_COMPRESSED_SIZE bytes).
+extern "C" COMBO_EXPORT uint8_t* MM_ComboPicto_PhotoI5(void) {
+    return gSaveContext.pictoPhotoI5;
+}
+
+// CHECK_QUEST_ITEM(QUEST_PICTOGRAPH)
+extern "C" COMBO_EXPORT int MM_ComboPicto_HasPhoto(void) {
+    return CHECK_QUEST_ITEM(QUEST_PICTOGRAPH) ? 1 : 0;
+}
+
+// SET_QUEST_ITEM / REMOVE_QUEST_ITEM(QUEST_PICTOGRAPH)
+extern "C" COMBO_EXPORT void MM_ComboPicto_SetHasPhoto(int has) {
+    if (has) {
+        SET_QUEST_ITEM(QUEST_PICTOGRAPH);
+    } else {
+        REMOVE_QUEST_ITEM(QUEST_PICTOGRAPH);
+    }
+}
+
+// Snap_RecordPictographedActors for a Hyrule scene: it clears both flag words, then flags only MM quest subjects
+// (Termina actors / scenes), none of which exist in Hyrule.
+extern "C" COMBO_EXPORT void MM_ComboPicto_RecordNoSubjects(void) {
+    gSaveContext.save.saveInfo.pictoFlags0 = 0;
+    gSaveContext.save.saveInfo.pictoFlags1 = 0;
+}
+
+// Interface_Draw's focus-frame textures: 0 = gPictoBoxFocusBorderTex, 1 = gPictoBoxFocusIconTex,
+// 2 = gPictoBoxFocusTextTex (draw inside a "mm" ResourceManager bracket).
+extern "C" COMBO_EXPORT const char* MM_ComboPicto_FocusTex(int which) {
+    switch (which) {
+        case 0:
+            return gPictoBoxFocusBorderTex;
+        case 1:
+            return gPictoBoxFocusIconTex;
+        case 2:
+            return gPictoBoxFocusTextTex;
+        default:
+            return nullptr;
+    }
+}
+
+// VB_PICTO_TAKE: fbufSave is the 320x240 RGBA16 capture (native endian, as FB_WriteFramebufferSliceToCPU writes it).
+extern "C" COMBO_EXPORT void MM_ComboPicto_ColorTake(const uint16_t* fbufSave) {
+    ConvertImage(pictoPhotoRGBABuffer, (u16*)fbufSave, SCREEN_WIDTH, PICTO_PHOTO_TOPLEFT_X, PICTO_PHOTO_TOPLEFT_Y,
+                 (PICTO_PHOTO_TOPLEFT_X + PICTO_PHOTO_WIDTH) - 1, (PICTO_PHOTO_TOPLEFT_Y + PICTO_PHOTO_HEIGHT) - 1);
+    SavePictoPng();
+}
+
+// VB_PICTO_ACTIVATE
+extern "C" COMBO_EXPORT void MM_ComboPicto_ColorLoad(void) {
+    LoadPictoPNG();
+}
+
+// VB_PICTO_DISPLAY: the colour photo (big-endian RGBA16, 160x112) when the ColorPictograph CVar is on and a colour
+// copy exists; NULL = draw MM's I8 strips.
+extern "C" COMBO_EXPORT const uint16_t* MM_ComboPicto_ColorPhoto(void) {
+    return (CVAR && (pictoPhotoRGBABuffer[0] != 0)) ? pictoPhotoRGBABuffer : nullptr;
+}
+#endif // COMBO_BUILD

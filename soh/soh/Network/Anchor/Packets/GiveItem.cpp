@@ -1,0 +1,178 @@
+#include <nlohmann/json.hpp>
+
+#include "soh/Network/Anchor/Anchor.h"
+#include "soh/Enhancements/randomizer/static_data.h"
+#include "soh/Notification/Notification.h"
+#include "soh/SohGui/ImGuiUtils.h"
+#include "soh/Enhancements/item-tables/ItemTableManager.h"
+
+extern "C" {
+#include "functions.h"
+#include "include/macros.h" // ComboShip: CUR_UPG_VALUE for the single-arrow case below
+extern PlayState* gPlayState;
+}
+
+/**
+ * GIVE_ITEM
+ */
+
+uint8_t incomingIceTrapsFromAnchor = 0;
+
+#ifdef COMBO_BUILD
+// ComboShip: Shared Items — suppresses this send around a local shared-tier raise (SOH_RaiseSharedTier),
+// which would otherwise broadcast a teammate toast for the player's own reconcile.
+extern "C" int gComboSuppressAnchorSend;
+#endif
+
+void Anchor::SendPacket_GiveItem(u16 modId, s16 getItemId) {
+#ifdef COMBO_BUILD
+    if (gComboSuppressAnchorSend) {
+        return;
+    }
+#endif
+    if (!IsSaveLoaded() || isProcessingIncomingPacket || !roomState.syncItemsAndFlags) {
+#ifdef COMBO_BUILD
+        SPDLOG_INFO("[Anchor] GIVE_ITEM not sent: saveLoaded={} processingIncoming={} syncItems={}", IsSaveLoaded(),
+                    isProcessingIncomingPacket, roomState.syncItemsAndFlags);
+#endif
+        return;
+    }
+
+    if (modId == MOD_RANDOMIZER && getItemId == RG_ICE_TRAP && incomingIceTrapsFromAnchor > 0) {
+        incomingIceTrapsFromAnchor = MAX(incomingIceTrapsFromAnchor - 1, 0);
+        return;
+    }
+
+    // Ignore sending master sword in final Ganon fight
+    if (modId == MOD_RANDOMIZER && getItemId == RG_MASTER_SWORD && gPlayState->sceneNum == SCENE_GANON_BOSS) {
+        return;
+    }
+
+    nlohmann::json payload;
+    payload["type"] = GIVE_ITEM;
+    payload["targetTeamId"] = CVarGetString(CVAR_REMOTE_ANCHOR("TeamId"), "default");
+    payload["addToQueue"] = true;
+    payload["modId"] = modId;
+    payload["getItemId"] = getItemId;
+
+    SendJsonToRemote(payload);
+#ifdef COMBO_BUILD
+    SPDLOG_INFO("[Anchor] GIVE_ITEM sent: modId={} getItemId={}", modId, getItemId);
+    // ComboShip: live partner feed (Anchor.cpp) so a teammate in MM sees this OOT find. Rando items only
+    // (MOD_NONE GIVE_ITEMs in a rando save are drops/ammo), never junk, never ice traps.
+    if (modId == MOD_RANDOMIZER && getItemId != RG_ICE_TRAP && getItemId > RG_NONE && getItemId < RG_MAX) {
+        auto& item = Rando::StaticData::RetrieveItem(static_cast<RandomizerGet>(getItemId));
+        if (item.GetGIEntry_Copy().getItemCategory != ITEM_CATEGORY_JUNK) {
+            Anchor_SendPartnerFind(item.GetName().english, "oot", "item");
+        }
+    }
+#endif
+}
+
+void Anchor::HandlePacket_GiveItem(nlohmann::json payload) {
+    if (!IsSaveLoaded() || !roomState.syncItemsAndFlags) {
+#ifdef COMBO_BUILD
+        if (isDormantApply) {
+            SPDLOG_INFO("[Anchor] dormant GIVE_ITEM dropped: saveLoaded={} syncItems={}", IsSaveLoaded(),
+                        roomState.syncItemsAndFlags);
+        }
+#endif
+        return;
+    }
+#ifdef COMBO_BUILD
+    // ComboShip: the shared socket also carries MM's GIVE_ITEM (randoCheckId shape, no modId). It's
+    // for the MM game, not us — skip it quietly instead of throwing on the missing key.
+    if (!payload.contains("modId")) {
+        return;
+    }
+#endif
+
+    uint32_t clientId = payload.at("clientId").get<uint32_t>();
+    AnchorClient& client = clients[clientId];
+    u16 modId = payload.at("modId").get<u16>();
+    u16 getItemId = payload.at("getItemId").get<u16>();
+
+    GetItemEntry getItemEntry;
+    if (modId == MOD_NONE) {
+        getItemEntry = ItemTableManager::Instance->RetrieveItemEntry(MOD_NONE, getItemId);
+    } else {
+        getItemEntry = Rando::StaticData::RetrieveItem(static_cast<RandomizerGet>(getItemId)).GetGIEntry_Copy();
+    }
+
+#ifdef COMBO_BUILD
+    // ComboShip: EnItem00's single-arrow drop grants via Item_Give(ITEM_BOW) (z_en_item00.c), which
+    // Return_Item maps to GI_BOW — so ONE arrow picked up by a teammate arrives here as a vanilla Bow
+    // (ITEM_CATEGORY_MAJOR: "found Fairy Bow" toast, and a bow-less receiver would get Bow + quiver).
+    // ComboShip is always rando, where the real Bow is RG_FAIRY_BOW (MOD_RANDOMIZER), so a MOD_NONE
+    // GI_BOW is always that single arrow: apply +1 arrow only, never the Bow, and stay silent.
+    if (IS_RANDO && modId == MOD_NONE && getItemId == GI_BOW) {
+        if (CUR_UPG_VALUE(UPG_QUIVER) > 0) {
+            Item_Give(gPlayState, ITEM_BOW); // quiver owned: AMMO(ITEM_BOW)++ capped (z_parameter.c)
+            if (isDormantApply) {
+                dormantDidApply = true;
+            }
+        }
+        return;
+    }
+#endif
+
+    if (getItemEntry.modIndex == MOD_NONE) {
+        if (getItemEntry.getItemId == GI_SWORD_BGS) {
+            gSaveContext.bgsFlag = true;
+        }
+        Item_Give(gPlayState, static_cast<u8>(getItemEntry.itemId));
+    } else if (getItemEntry.modIndex == MOD_RANDOMIZER) {
+        if (getItemEntry.getItemId == RG_ICE_TRAP) {
+            gSaveContext.ship.pendingIceTrapCount++;
+            incomingIceTrapsFromAnchor++;
+        } else {
+            Randomizer_Item_Give(gPlayState, getItemEntry);
+        }
+    }
+
+#ifdef COMBO_BUILD
+    // ComboShip: mirror the receive-hook side effects (found-shield/tunic flags, Epona event,
+    // Skip-Planting-Beans pre-plant) that this save-direct grant bypasses. See OTRGlobals.cpp.
+    extern void Combo_ApplyItemReceiveSideEffects(const GetItemEntry& gie);
+    Combo_ApplyItemReceiveSideEffects(getItemEntry);
+#endif
+
+    // Full heal if getting a heart container or piece
+    if (getItemEntry.gid == GID_HEART_CONTAINER || getItemEntry.gid == GID_HEART_PIECE) {
+        gSaveContext.healthAccumulator = 0x140;
+    }
+
+    // Handle if the player gets a 4th heart piece (usually handled in z_message)
+    s32 heartPieces = (s32)(gSaveContext.inventory.questItems & 0xF0000000) >> (QUEST_HEART_PIECE + 4);
+    if (heartPieces >= 4) {
+        gSaveContext.inventory.questItems &= ~0xF0000000;
+        gSaveContext.inventory.questItems += (heartPieces % 4) << (QUEST_HEART_PIECE + 4);
+        gSaveContext.healthCapacity += 0x10 * (heartPieces / 4);
+        gSaveContext.health += 0x10 * (heartPieces / 4);
+    }
+
+#ifdef COMBO_BUILD
+    // ComboShip: no toast while OOT is backgrounded — it would surface in the wrong game later.
+    if (isDormantApply) {
+        dormantDidApply = true;
+        SPDLOG_INFO("[Anchor] dormant GIVE_ITEM applied: modId={} getItemId={}", modId, getItemId);
+        return;
+    }
+#endif
+    if (getItemEntry.getItemCategory != ITEM_CATEGORY_JUNK) {
+        if (getItemEntry.modIndex == MOD_NONE) {
+            Notification::Emit({
+                .itemIcon = GetTextureForItemId(getItemEntry.itemId),
+                .prefix = client.name,
+                .message = "found",
+                .suffix = SohUtils::GetItemName(getItemEntry.itemId),
+            });
+        } else if (getItemEntry.modIndex == MOD_RANDOMIZER) {
+            Notification::Emit({
+                .prefix = client.name,
+                .message = "found",
+                .suffix = Rando::StaticData::RetrieveItem((RandomizerGet)getItemEntry.getItemId).GetName().english,
+            });
+        }
+    }
+}

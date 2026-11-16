@@ -1,0 +1,61 @@
+#pragma once
+
+#include "../item-tables/ItemTableTypes.h"
+
+typedef struct PlayState PlayState;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+void Randomizer_DrawSmallKey(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawMap(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawCompass(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawKeyRing(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawBossKey(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawBeanSprout(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawBossSoul(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawDoubleDefense(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawMasterSword(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawTriforcePiece(PlayState* play, GetItemEntry getItemEntry);
+void Randomizer_DrawTriforcePieceGI(PlayState* play, GetItemEntry getItemEntry);
+void Randomizer_DrawOcarinaButton(PlayState* play, GetItemEntry* getItemEntry);
+#ifdef COMBO_BUILD
+void Randomizer_DrawSongOfSoaring(PlayState* play, GetItemEntry* getItemEntry); // ComboShip (teleport songs)
+#endif
+void Randomizer_DrawBronzeScale(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawPowerBracelet(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawLadder(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawKneePads(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawJabberNut(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawOpenChest(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawSilverRupee(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawFishingPoleGI(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawScarecrowsSong(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawSkeletonKey(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawMysteryItem(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawBombchuBag(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawOverworldKey(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawRocsFeather(PlayState* play, GetItemEntry* getItemEntry);
+#ifdef COMBO_BUILD
+// ComboShip: render a foreign (MM-bound) check with the real MM item model via "@mm:" cross-RM
+// routing; falls back to the blue-rupee sentinel when the model can't be resolved. The check
+// identity rides in getItemEntry->comboForeignCheck.
+void Randomizer_DrawComboForeign(PlayState* play, GetItemEntry* getItemEntry);
+// ComboShip: freeze a foreign check's model at the tier it grants, before the cross-grant that
+// follows mutates MM's dormant save and a live re-resolve flips the held-up model next frame.
+void Randomizer_LatchComboForeign(int32_t rc); // RandomizerCheck, as int32_t like comboForeignCheck
+// ComboShip: resolved tier name for a latched (frozen) / live-previewed foreign check, or NULL.
+const char* Randomizer_ComboForeignLatchedName(int32_t rc);
+const char* Randomizer_ComboForeignLiveName(int32_t rc);
+#endif
+void Randomizer_DrawNutBag(PlayState* play, GetItemEntry* getItemEntry);
+void Randomizer_DrawStickBag(PlayState* play, GetItemEntry* getItemEntry);
+
+#define GET_ITEM_MYSTERY                                                                                 \
+    {                                                                                                    \
+        ITEM_NONE_FE, 0, 0, 0, 0, MOD_RANDOMIZER, MOD_RANDOMIZER, ITEM_NONE_FE, 0, false, ITEM_FROM_NPC, \
+            ITEM_CATEGORY_JUNK, ITEM_NONE_FE, MOD_RANDOMIZER, (CustomDrawFunc)Randomizer_DrawMysteryItem \
+    }
+#ifdef __cplusplus
+};
+#endif

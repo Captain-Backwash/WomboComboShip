@@ -1,0 +1,561 @@
+# ComboShip deviations — Anchor networking
+
+Preserved deviations — keep across upstream merges. See [../UPSTREAM_MERGES.md](../UPSTREAM_MERGES.md) for the merge mechanism.
+
+## Anchor transport moved to the launcher (combo-owned connection) — Phase 1 (2026-06-17)
+
+**Why:** Anchor (upstream SoH online co-op) owned its own TCP socket + receive thread inside
+`soh.dll`, so the connection died on every OOT↔MM portal transition and could never be shared with
+MM. ComboShip now owns ONE persistent connection in `ComboShip.exe` that survives transitions and
+will later route packets to whichever game is active. OOT's Anchor is **not relocated** — only its
+transport is redirected through a minimal COMBO_BUILD seam; all packet/handler/menu/dummy-player
+logic stays byte-intact in `soh/soh/Network/Anchor/`. A relay probe (since removed) confirmed the
+public hm64 server relays our packet types peer-to-peer, so no server changes are needed.
+
+**`soh/soh/Network/Network.h` + `Network.cpp` (vendored, COMBO_BUILD-guarded — preserve on future
+soh merges):** under `COMBO_BUILD`, `Enable`/`Disable` no longer open a socket or spawn
+`ReceiveFromServer`; they call launcher-registered hooks `gComboAnchorConnect`/`gComboAnchorDisconnect`.
+`SendDataToRemote` routes to `gComboAnchorSend` instead of `SDLNet_TCP_Send`. Two new members feed
+the launcher's receive thread back in: `InjectIncomingJson` (reuses `HandleRemoteJson`) and
+`SetConnectedFromCombo` (drives `OnConnected`/`OnDisconnected`). The original socket bodies are kept
+intact under `#else` for non-combo builds. No original lines deleted.
+
+**`soh/soh/Network/Anchor/Anchor.cpp` (vendored, COMBO_BUILD-guarded):** `SendJsonToRemote` sends
+immediately via `Network::SendJsonToRemote` under `COMBO_BUILD` (the launcher owns the thread-safe
+outgoing queue), instead of pushing to the game-side `outgoingPacketQueue` that nothing would drain
+without the local receive thread. Non-combo path unchanged.
+
+**`soh/soh/OTRGlobals.cpp` (vendored, COMBO_BUILD-guarded):** six new exports — `SOH_SetAnchorSend`,
+`SOH_SetAnchorConnect`, `SOH_SetAnchorDisconnect` (store the launcher's transport hooks),
+`SOH_Anchor_RecvJson`, `SOH_Anchor_OnConnected`, `SOH_Anchor_OnDisconnected` (drive the in-place
+Anchor). `declspec` follows `extern "C"` (the export-visibility ordering trap).
+
+**Combo-owned (no further vendored churn):**
+- `combo/ComboShip.cpp` — `namespace ComboAnchor` owns the SDL_net socket + receive thread + a
+  thread-safe outgoing queue, framing NUL-delimited JSON exactly like the old `Network`. It
+  registers `Send`/`Connect`/`Disconnect` into soh at boot and dispatches inbound packets via
+  `SOH_Anchor_RecvJson`. `ComboAnchor::Shutdown()` joins the thread BEFORE any `FreeDll` (the thread
+  calls into soh.dll). `#define SDL_MAIN_HANDLED` precedes the SDL include so SDL doesn't hijack
+  `main`.
+- `combo/CMakeLists.txt` — `ComboShip` now links `SDL2_net` (`-static` on the static-md triplet),
+  mirroring soh's linkage; SDL2main is intentionally not linked.
+
+On future merges: if upstream restructures `Network`/`Anchor` transport, re-apply the COMBO_BUILD
+`#else` split. The launcher-side connection and dispatch are combo-owned and merge-independent.
+
+## MM Anchor adapter — Phase 2a (MM joins the shared connection) (2026-06-17)
+
+**Why:** MM had no online presence — when a co-op player crossed into MM, peers saw their stale last
+OOT location ("Happy Mask Shop") because OOT's Anchor went dormant and nothing on the MM side sent
+updates. Phase 2a adds an MM-side Anchor adapter that piggybacks on the launcher-owned connection
+(no second socket, no MM Anchor menu) and sends MM client-state with a namespaced scene id.
+
+**Combo-owned / new (no vendored churn):**
+- `mm/2s2h/Network/Anchor/MMAnchor.{h,cpp}` (new) — standalone MM Anchor adapter. Sends via the
+  launcher callback `gMMComboAnchorSend`, receives via the `MM_Anchor_RecvJson` export, is
+  activated/deactivated by the launcher on transitions. Emits JSON shapes matching soh's Anchor
+  (`UPDATE_CLIENT_STATE`/`ALL_CLIENT_STATE`) for cross-client interop. Reads the same process-global
+  `gRemote.Anchor.*` CVars OOT's menu wrote (literals spelled out — MM lacks soh's prefix macro).
+  Scene ids are namespaced (`MM_ANCHOR_SCENE_NAMESPACE = 1000`, fits `s16`) so MM and OOT scene
+  numbers never collide in the shared roster / presence matching. Exports: `MM_SetAnchorSend`,
+  `MM_Anchor_RecvJson`, `MM_Anchor_Activate`, `MM_Anchor_Deactivate`. Picked up by MM's existing
+  `GLOB_RECURSE 2s2h/*.cpp` (CMake reconfigure required after adding the files).
+- `combo/ComboShip.cpp` — `ComboAnchor` now tracks `sActiveGame`, routes inbound packets to the
+  active game, registers `MM_SetAnchorSend`, and calls `SetActiveGame(0|1)` at each transition
+  (activates MM's adapter on OOT→MM, deactivates on the way back). OOT self-reactivates via its own
+  GameInteractor hooks, so it needs no explicit activate.
+
+**`soh/soh/Network/Anchor/AnchorRoomWindow.cpp` (vendored, COMBO_BUILD-guarded — preserve on future
+soh merges):** the room window labels a peer whose `sceneNum >= 1000` (an MM peer) as "Majora's Mask"
+instead of running its namespaced id through OOT's `SohUtils::GetSceneName` (which would render a
+bogus OOT scene name). It also suppresses the seed-mismatch warning for MM peers (`sceneNum >= 1000`)
+— OOT's rando seed and MM's seed aren't comparable, so the check would always false-positive;
+real cross-game seed verification (both games reporting the shared combo masterSeed) is Phase 3.
+Minimal stopgap; Phase 4 moves the room window into the unified combo UI with real MM scene names.
+No original lines deleted.
+
+## MM Anchor adapter — Phase 2b (remote-player puppet + PLAYER_UPDATE) (2026-06-17)
+
+**Why:** make co-op partners visible in MM. Adds per-frame pose broadcast and a "puppet" actor that
+renders remote players' Link across all five transformation forms.
+
+**Combo-owned / new (no vendored churn):**
+- `mm/2s2h/Network/Anchor/MMAnchor.{h,cpp}` extended to the canonical Anchor field set + `PLAYER_UPDATE`
+  send/receive, `RefreshClientActors`, and the `ShouldActorInit`/`OnActorUpdate` hooks.
+- `mm/2s2h/Network/Anchor/DummyPlayer.cpp` (new) — the puppet actor. **Ported from the canonical
+  2S2H Anchor PR (2ship2harkinian/2ship2harkinian#1349, by the SoH Anchor author)**, adapted to
+  ComboShip's launcher-owned transport (`MMAnchor` instead of a socket-owning `Anchor`) and
+  `gRemote.Anchor.*` CVar keys. Spawns `ACTOR_PLAYER` → re-tags to `ACTOR_ITEM_INBOX`/`ACTORCAT_NPC`
+  with `DummyPlayer_*` funcs; inits with `gPlayerSkeletons[transformation]` + a mask segment; reuses
+  vanilla `Player_DrawGameplay`; respawns on form change. All five forms render through stock code.
+- Implementation notes vs canonical: joint buffers are serialized as plain int arrays (nlohmann
+  reserves `std::vector<u8>` for its binary type); `posRot` is read via the existing `Vec3f`/`Vec3s`
+  converters (no `from_json<PosRot>` in this project's `BenJsonConversions.hpp`); client-state carries
+  BOTH a namespaced `sceneNum` (OOT roster display) and a raw `sceneId` (MM same-scene puppet match).
+
+No vendored MM source was modified for 2b (unlike the canonical PR, which added `OnSceneSpawnActors`/
+`OnPlayerSfx` hooks to `z_actor.c` — ComboShip uses the existing `OnSceneInit`/`OnActorUpdate` hooks
+instead, avoiding any vendored edit).
+
+## MM Anchor adapter — Phase 2c (shared-progression item sync) (2026-06-18)
+
+**Why:** make a check collected by one co-op player benefit the whole team. ComboShip chose
+*shared-progression* co-op (decided 2026-06-17), not the canonical PR's *multiworld/routed-ownership*
+model — so a locally-obtained check's item is broadcast to all teammates rather than released to an
+owner. The apply path still mirrors the canonical (`ConvertItem` → junk fallback → `Rando::GiveItem`).
+
+**Combo-owned (MMAnchor):** `SendPacket_GiveItem`/`HandlePacket_GiveItem` + `GIVE_ITEM` dispatch. The
+wire carries the **raw** `randoItemId` + its `randoCheckId`; each receiver runs `ConvertItem` against
+its *own* progressive state (so progressive items resolve to the receiver's correct tier) and marks
+`RANDO_SAVE_CHECKS[rc]` obtained to avoid double-collection. `applyingRemoteItem` guards the
+grant→broadcast loop; `targetTeamId` scopes to the team; self-broadcasts are ignored by clientId.
+Flag sync is intentionally deferred (mirrors the canonical, whose `HandlePacket_SetFlag` is stubbed).
+
+**`mm/2s2h/Rando/MiscBehavior/CheckQueue.cpp` (vendored MM rando, COMBO_BUILD-guarded — preserve on
+future mm merges):** at the existing local check-grant point, one guarded call
+`MMAnchor_BroadcastCheckItem((int)CUSTOM_ITEM_PARAM, (int)randoSaveCheck.randoItemId)` (placed while
+`CUSTOM_ITEM_PARAM` still holds the checkId, before it's overwritten with the item id on the next
+line) + one extern declaration in the file's existing COMBO_BUILD include block. No original lines
+moved/deleted. The function is a no-op unless Anchor is active, so non-co-op rando play is unaffected.
+
+## MM Anchor adapter — Phase 2d (late-join / reconnect resync) (2026-06-18)
+
+**Why:** bring a late-joining or reconnecting co-op client up to the team's current progression.
+
+**Combo-owned (MMAnchor, no vendored churn):** ported the canonical `UPDATE_TEAM_STATE` /
+`REQUEST_TEAM_STATE` (2S2H PR #1349) onto the launcher transport. On save (`AfterEndOfCycleSave`) and
+in reply to a `REQUEST_TEAM_STATE`, a client serializes its whole `gSaveContext.save` (via
+`BenJsonConversions`, with the rando-check array compacted — **7 fields**, dropping the canonical's
+`multiWorldTeamIndex` since ComboShip is shared-progression, not multiworld). A client requests team
+state on `OnSaveLoad` and on connect-while-in-game. On receive it restores receiver-local fields
+(bottle contents, non-zero ammo, checksum, fileCreatedAt, `newf`, dpad/button layout, playerName),
+then commits **only** `saveInfo` + `shipSaveInfo` — top-level `Save` fields (scene/entrance/time/day/
+`playerForm`/cycle) are intentionally left untouched so the receiver isn't relocated — then re-runs
+`Rando::CheckTracker::OnFileLoad` / `ActorBehavior::OnFileLoad` / `ShipInit::Init("IS_RANDO")`. Queued
+packets ride along and are replayed through the normal incoming queue. Known canonical tradeoff
+(accepted): the resync overwrites the receiver's HP/magic/rupees/respawn/scene-flags with the team's.
+Same-game only (MM `permanentSceneFlags`/commit-hash layout). No vendored MM source modified for 2d.
+
+## Anchor auto-reconnect on boot restored (2026-07-16)
+
+**Why:** `Combo_FinishInit` (OTRGlobals.cpp) had a `COMBO_BUILD` branch that `CVarClear`ed
+`gAnchor.Enabled` on every boot ("Anchor always starts DISABLED") instead of auto-connecting, so
+Anchor stayed disconnected after a restart. That predated the launcher wiring the Anchor connect
+transport before `SOH_Init`; with the transport now registered first, boot-time `Enable()` opens a
+real socket rather than wedging on "Connecting…". Dropped the combo-only branch so boot auto-connects
+from the persisted `gAnchor.Enabled` flag, matching upstream SoH (a deviation removed, not added).
+
+## Anchor co-op sync hardening, bug 3: MM time-travel duplicate grants (2026-07-16)
+
+**Why:** MM's `RandoSaveCheck` has two flags: `cycleObtained` (wiped every Song of Time,
+`OnCycleSave.cpp`) and `obtained` (permanent). Co-op broadcast and cross-game delivery were driven by
+the give-lambda running again each cycle, re-sharing/re-delivering an already-permanent check.
+
+Fixes, all `COMBO_BUILD`:
+- `CheckQueue.cpp`: capture `obtained` BEFORE the grant; only call `MMAnchor_BroadcastCheckItem` /
+  `SendForeignCheck` (cross-deliver) the first time a check becomes permanently obtained. Local grant
+  (`Rando::GiveItem`) is untouched — renewables still re-give locally, only re-SHARING is suppressed.
+- `gComboCrossDeliver`/`gMMComboCrossDeliver` gained a `srcCheckName` parameter. The launcher's
+  `DeliverCrossItem` (`combo/ComboShip.cpp`) dedups on it: the same wire `COMBO_CROSS_ITEM` packet
+  reaches both DLLs' queues (an explicit `originGame` filter exception), so whichever games later
+  process their own copy could each independently deliver — one shared in-memory set closes that.
+- `MMAnchor::HandlePacket_UpdateTeamState` / OOT's `UpdateTeamState.cpp`: resync now unions rather than
+  replaces permanent progress — MM snapshots local `obtained` flags before the wholesale
+  `shipSaveInfo` assignment and restores any the incoming state lacked; OOT only advances
+  `RandomizerCheckStatus` (progressive enum) instead of unconditionally overwriting it, so a
+  stale/incomplete peer's resync can't un-collect a check.
+
+## Anchor co-op sync hardening, bug 1: MM shop buys never broadcast (2026-07-16)
+
+**Why:** MM broadcast co-op progress only from `CheckQueue.cpp` (the physical rando check path);
+Bomb/Curiosity shop buys grant directly through `EnGirlA_RandoBuyFunc` (`EnGirlA.cpp`, `EnFsn.cpp`
+just forwards to the same `buyFunc`) without ever calling `MMAnchor_BroadcastCheckItem`, so shop
+purchases never reached teammates.
+
+Fix: factored the bug-3 first-time-obtained broadcast guard into a shared seam,
+`Rando::MiscBehavior::BroadcastCheckObtainedIfFirst` (`MiscBehavior.h`/`CheckQueue.cpp`), and wired
+`EnGirlA_RandoBuyFunc` to call it (both the normal buy and the OOT-bound foreign-item buy branch,
+which gets the same wasObtained guard as `CheckQueue.cpp`'s foreign path). `CheckQueue.cpp`'s own
+broadcast call now goes through the same seam instead of calling `MMAnchor_BroadcastCheckItem`
+directly, so future MM grant paths have one shared, idempotent broadcast point to hook into.
+
+## Anchor co-op sync hardening, bug 2: launcher-owned both-games resync (2026-07-16)
+
+**Why:** the resync button was OOT-only and foreground-only (`soh/soh/Network/Anchor/Menu.cpp:132`);
+`REQUEST_TEAM_STATE`'s dormant answer path was broken in both games (OOT's `PumpDormant` REQUEST
+branch didn't set `isDormantApply` like its `GIVE_ITEM` branch did, so `IsSaveLoaded()` always failed;
+MM's `SendTeamStateFromSave` gated on `IsSaveLoaded()`, which requires `gPlayState` — always null while
+MM is dormant); and nothing let a dormant sibling itself REQUEST a resync (MM's
+`SendPacket_RequestTeamState` is `isActive`-gated).
+
+Fixes, all `COMBO_BUILD`:
+- `Anchor::PumpDormant` (`soh/soh/Network/Anchor/Anchor.cpp`) now wraps the `REQUEST_TEAM_STATE`
+  branch in `isDormantApply` like the `GIVE_ITEM` branch already did.
+  (#214) It also calls `Combo_FlushDormantAccumulators()` before its save, so dormant rupee/magic grants
+  persist; MM's pump already did via `Combo_MM_GiveDormantResolved` (see rando.md, "Paused-save flush").
+- `MMAnchor::SendTeamStateFromSave` (`mm/2s2h/Network/Anchor/MMAnchor.cpp`) now judges by
+  `gSaveContext.fileNum` instead of `IsSaveLoaded()`, so it answers even while MM is dormant.
+- New dormant-safe request seam per game: `Anchor::RequestResyncDormantSafe()` /
+  `MMAnchor::RequestResyncDormantSafe()`, exported as `SOH_Anchor_RequestResync()` /
+  `MM_Anchor_RequestResync()`. MM's bypasses `SendJson`'s `isActive` gate (constructs+sends the
+  `REQUEST_TEAM_STATE` JSON directly) since the whole point is a dormant MM asking for a resync too.
+- Launcher orchestration (`combo/ComboShip.cpp`): both exports are called, unconditionally, on every
+  (re)connect — a late-joiner/reconnect resync now pulls a peer's OOT AND MM progress, and this
+  client's own dormant sibling gets asked too. Per-game `originGame` packet isolation is untouched;
+  orchestration happens at the launcher, not inside either game's filter.
+- Manual control: a "Resync team state" button in the combo-owned Shared > Settings > Network panel
+  (`combo/gui/ComboMenu.cpp`), resolving both exports the same way the existing combo-gen syms are
+  resolved (`Combo_ResolveSym` — comboui has no other way to call into the game
+  modules; see `combo/ComboResolve.h`) and calling both. This is NOT the full "Ship of Harkinian -> Network settings" migration to
+  combo-owned UI (separate follow-up) — just the resync control. The existing OOT Menu.cpp button is
+  unchanged and still works.
+
+## Anchor co-op sync: code-review fixes on bugs 1-3 (2026-07-16)
+
+**Why:** review of the above three entries found the bug-3 union was incomplete (MM still lost
+permanent progress on resync) and three smaller issues in the bug-2 plumbing.
+
+Fixes, all `COMBO_BUILD`:
+- `MMAnchor::HandlePacket_UpdateTeamState` (`mm/2s2h/Network/Anchor/MMAnchor.cpp`): the bug-3 union
+  only covered `RANDO_SAVE_CHECKS[i].obtained`; the wholesale `saveInfo`/`shipSaveInfo` assignment
+  still let a stale peer erase `weekEventReg`, owned masks, quest items, upgrade tiers, and heart
+  containers. Now snapshots those before the assignment and OR/max-merges them back in: `weekEventReg`
+  (byte-wise OR, MM's analog of OOT's `eventChkInf`), `inventory.items[24..47]` (mask ownership slots,
+  restore-if-local-non-empty), `inventory.questItems` (OR), `inventory.upgrades` (per-field max via
+  `gUpgradeMasks`/`gUpgradeShifts`), `playerData.healthCapacity` (max).
+- `soh/soh/Network/Anchor/Packets/UpdateTeamState.cpp`: `SetIsSkipped` was unconditional next to the
+  now-progressive `SetCheckStatus`; a stale peer with `isSkipped=false` could un-skip a local skip. Now
+  only applies the incoming skip when it's `true` and local isn't already.
+- `SOH_Anchor_RequestResync`/`MM_Anchor_RequestResync` (`OTRGlobals.cpp`/`MMAnchor.cpp`): wrapped in
+  try/catch — both call into JSON/CVar code with no prior guard, and are `extern "C"` exports the
+  launcher calls, so a throw would have unwound across the DLL boundary.
+- `combo/ComboShip.cpp`: the auto-resync-on-connect call moved off the network `ReceiveLoop` thread. It
+  now sets an `std::atomic<bool> sResyncPending` flag; the existing per-frame `PumpDormant` (already
+  running on the active game's thread) drains it once and fires both resync exports there, avoiding a
+  race with `PumpDormant`'s own `isDormantApply`/`gPlayState` use. Also scoped the cross-item dedup set
+  (`sAppliedCrossChecks`) to the active seed — cleared via `ResetCrossItemDedupForSeed` whenever
+  `masterSeed` changes (regen or reload-from-file), so a check name reused across seeds isn't dropped
+  as a false duplicate. `ResetCrossItemDedupForSeed` runs on the generation worker thread while
+  `DeliverCrossItem` runs on the game thread, so both now take `sAppliedCrossChecksMutex`.
+
+## Anchor co-op sync: toast-burst + name-tag color (2026-07-17)
+
+**Why:** the "Save updated from team" toast fired 2-3x on every connect and on every manual resync
+button press, even solo. Root cause: `Anchor::OnConnected` (soh) sent its own
+`REQUEST_TEAM_STATE` in addition to the launcher's on-connect resync (`SOH_Anchor_RequestResync` +
+`MM_Anchor_RequestResync`), so a solo/no-teammate reply (server answers directly when no teammates
+are online) lands once per send, and `ReceiveLoop` forwards every reply to BOTH game DLLs
+unconditionally — the foreground game applies+toasts on each one it receives (the dormant game's
+`PumpDormant` already silently drops `UPDATE_TEAM_STATE`, so it never double-toasts).
+
+Fixes, all `COMBO_BUILD`:
+- `soh/soh/Network/Anchor/Anchor.cpp` (`OnConnected`): removed the redundant direct
+  `SendPacket_RequestTeamState()` call — the launcher's resync is the sole on-connect source now.
+- `soh/soh/Network/Anchor/Packets/UpdateTeamState.cpp` + `mm/2s2h/Network/Anchor/MMAnchor.cpp`
+  (`HandlePacket_UpdateTeamState`): debounce the toast (2s, `steady_clock`) — the state merge still
+  runs every time (idempotent), only the notification is deduped. Sender-count-agnostic, so it also
+  covers the manual "Resync team state" button (which legitimately sends both an OOT and an MM
+  request) and any other multi-reply burst.
+- `soh/soh/Network/Anchor/DummyPlayer.cpp` + `mm/2s2h/Network/Anchor/DummyPlayer.cpp`: remote puppet
+  name tags now use the client's Anchor color (`client.color`) instead of the dark default
+  (`NameTagOptions.textColor` alpha 0).
+
+## MM team-state merge + deferred cycle-save broadcast (2026-08-22)
+
+**Why:** MM's `HandlePacket_UpdateTeamState` replaced `saveInfo`/`shipSaveInfo` wholesale where OOT
+max-merges (`soh/soh/Network/Anchor/Packets/UpdateTeamState.cpp:283-290`), so a resync could truncate
+Small Keys, Stray Fairies and dungeon items — and, worse, hand us the peer's `saveType`, flipping
+`IS_RANDO` and silently unregistering every rando hook (including the Song of Time key restore).
+Separately, MMAnchor broadcast from `AfterEndOfCycleSave`, which can run *before* the rando restore hook:
+`RegisteredGameHooks<H>::functions` is an `std::unordered_map`, so hook order is not registration order
+and no ordering-based fix is sound.
+
+Fixes, receiver-only, no wire change (`mm/2s2h/Network/Anchor/MMAnchor.{h,cpp}`):
+- **Two early drop-guards**, neither conditioned on `IS_RANDO` — the handler is also reached with
+  `isDormantApply == true` from `PumpDormant`, which persists immediately afterwards, so an `IS_RANDO`-gated
+  guard would have skipped exactly the dormant path. (1) Local save not `SAVETYPE_RANDO` → warn and return;
+  there is no vanilla mode in ComboShip, so that means nothing usable is loaded, and preserving that
+  `saveType` through the merge *is* the original key-eating bug. (2) No `rando` block in the incoming
+  `shipSaveInfo` → warn and return: a non-rando peer serializes a zeroed `rando` struct
+  (`BenJsonConversions.hpp`), which the wholesale assign would turn into an empty `RANDO_SAVE_CHECKS`.
+- **Local `saveType` preserved** alongside `fileCreatedAt` in the receiver-local restore block.
+- **Max/OR-merge** `inventory.dungeonKeys`, `inventory.strayFairies`, `rando.foundDungeonKeys` (all `s8`,
+  `-1` when fresh, so signed max handles the sentinel) and OR `inventory.dungeonItems` (u8 bitfield).
+  Accepted, per the OOT precedent: a stale peer resync can re-grant a locally-spent Small Key.
+- **Deferred broadcast**: `AfterEndOfCycleSave` sets `pendingCycleSaveBroadcast`; MMAnchor's existing
+  `OnGameStateUpdate` hook sends it. `GameState_Update` runs `main` (where `Sram_SaveEndOfCycle` and all
+  `AfterEndOfCycleSave` hooks complete synchronously) before `GameInteractor_ExecuteOnGameStateUpdate`
+  (`mm/src/code/game.c:151-168`), so the send still lands the same frame, strictly after every restore.
+  A quit on that same frame drops the send harmlessly — peers re-request on connect. `Deactivate()` clears
+  the flag so an unsent broadcast can't fire unsolicited on the next activation.
+
+`Rando::MiscBehavior::OnFileLoad()` is still deliberately absent from the post-merge re-init block: it
+calls `CheckQueueReset()`, which would drop queued in-flight grants. Preserving the local `saveType`
+keeps its already-registered hooks valid, so it is not needed.
+
+## Issue #199: zeroed-boot MM save corruption on early resync (2026-09-09)
+
+**Why:** MM's eager boot (`MM_BootForCombo`) skips its game loop entirely, so `Setup_InitImpl` —
+and its `SaveContext_Init` zero-fill — never runs; `gSaveContext` sits at its BSS zero-state, where
+`fileNum == 0` / `SAVETYPE_VANILLA` was indistinguishable from a real loaded slot 1 until the first
+`SaveManager_LoadSaveFile`. Every dormant writer gated on `fileNum != 0xFF`, which that zero-state
+always passes. Combined with `MMAnchor::PumpDormant` persisting on a *predicted* `willApply` (computed from the
+packet shape before the handler ran, not from whether it actually merged anything), a teammate's
+`UPDATE_TEAM_STATE` arriving before a player picked a save slot got refused by the handler's
+`!IS_RANDO` guard but still triggered `SaveManager_SaveCurrentForCombo()`, writing the zeroed save
+(all-zero items == `ITEM_OCARINA_OF_TIME`) into slot 1. Reported as "ocarina in all slots".
+
+**Invariant (hard gate):** when MM has no usable save loaded (`fileNum` not in 0..2, or not `IS_RANDO`),
+MM is completely inert to Anchor — never answers, applies, or persists anything. The on-disk save stays
+byte-identical; a lost resync is recovered naturally when MM's own `OnSaveLoad` hook re-requests one
+after the real slot load. No repair/detection machinery was added — per `save-compat not required`, a
+corrupted/lost save from an old build stays lost; this fix only stops new corruption.
+
+Fixes, all `COMBO_BUILD`, no vendored `mm/src` edits:
+- `mm/2s2h/BenPort.cpp` (`MM_BootForCombo`): stamps `fileNum = 0xFF` / `saveType = SAVETYPE_VANILLA`
+  right after `MM_RunMain()` returns — the same sentinel a failed load already uses
+  (`SaveManager_LoadFailedForCombo`). Zeroed BSS can no longer read as slot 1.
+- `mm/2s2h/Network/Anchor/MMAnchor.{h,cpp}`: `willApply` (a pre-handler prediction) replaced with
+  `dormantDidApply`, set by `HandlePacket_UpdateTeamState` only at its true commit point (mirrors soh's
+  `Anchor::dormantDidApply`). `PumpDormant` now persists once after draining its queue, iff
+  `dormantDidApply && HasLoadedRandoSave()` — not per-packet on a guess. `isDormantApply` is reset via a
+  scope guard so an exception from the handler can't leave it stuck true.
+- New `MMAnchor::HasLoadedRandoSave()` (`fileNum` 0..2 **and** `IS_RANDO`) replaces the looser
+  `fileNum` range check in `SendTeamStateFromSave` (don't answer a request with a zeroed/non-rando save)
+  and the `IS_RANDO`-only guard in `HandlePacket_UpdateTeamState` (a boot-sentinel `fileNum` with a
+  stale `IS_RANDO` read would otherwise still slip through).
+- `mm/2s2h/SaveManager/SaveManager.cpp` (`SaveManager_SaveCurrentForCombo`): single refusing guard at
+  the actual write — `ERROR` log + return if `fileNum` isn't 0..2 (no assert: 0xFF reaches this
+  legitimately whenever play proceeds after an ordinary failed load). This is the storage-level
+  backstop behind every dormant writer (`Combo_MM_GiveDormantResolved`, `MM_MarkForeignObtained`,
+  `MM_TriggerTriforceCredits`, the trap-defer path in `Traps.cpp`, and `MMAnchor::PumpDormant`), all of
+  which still keep their own `fileNum != 0xFF` gates — the point is that none of them has to be perfect
+  for the invariant to hold.
+- `mm/2s2h/BenPort.cpp` (`Combo_LoadMMSaveFile`): the non-rando tripwire now also calls the shared
+  `SaveManager_MarkNoSaveLoaded()` before returning -6. `SaveManager_LoadSaveFile` already points
+  `fileNum` at the slot it read, so without this a non-rando (e.g. already-corrupted) save left
+  `fileNum` 0..2 with `IS_RANDO` false — passing the range-only backstop above and reaching a dormant
+  writer through a path the boot-sentinel fix doesn't cover.
+- `combo/ComboShip.cpp` (`Combo_OnOOTSaveLoad`): fires `MM_Anchor_RequestResync()` right after a
+  successful dormant-peek `MM_LoadSaveForCombo`, instead of waiting for MM's foreground entry
+  (`MMAnchor::OnSaveLoad` is `isActive`-gated) — closes the gap between "a save is loaded" and
+  "MM can actually consume a resync".
+
+**Deviation from the reviewed plan:** the plan additionally proposed gating `RequestResyncDormantSafe`
+on `HasLoadedRandoSave` ("don't ask for a state we can't consume"). Left unchanged — the reported
+sequence and this fix's own playtest table depend on the dormant boot-time resync *request* still going
+out while no slot is loaded yet (that's what proves the refusal path works); it's the *reply* that's now
+correctly refused by `HandlePacket_UpdateTeamState`'s `HasLoadedRandoSave` guard.
+
+## OOT co-op sync audit: flag echo, effect leak, single-arrow-as-Bow (2026-11-07)
+
+**Why:** audit of the same-game shared-progression sync (OOT↔OOT over Anchor). Item sync
+(`OnItemReceive` → `GIVE_ITEM`, which every `Item_Give`/`Randomizer_Item_Give` reaches via
+`Return_Item_Entry`, including `EnItem00` rupee/ammo/heart drops), world-flag sync (`OnSceneFlagSet`/
+`OnFlagSet` → `SET_FLAG`/`UNSET_FLAG`) and same-room chest state (`EnBox_WaitOpen` already switches to
+`EnBox_Open` once the treasure flag is set) all exist upstream. Three defects remained.
+
+Fixes, all `COMBO_BUILD`, no wire change:
+- `soh/soh/Network/Anchor/Packets/SetFlag.cpp` / `UnsetFlag.cpp` (`SendPacket_*`): skip while
+  `isProcessingIncomingPacket`, like `GIVE_ITEM`/`ENTRANCE_DISCOVERED` already did. A flag set as a side
+  effect of applying a remote packet (e.g. `Randomizer_Item_Give` inside `HandlePacket_GiveItem`) was
+  echoed back to the whole team — one redundant hop per receiver, O(N²) packets per flag. Terminating
+  before (the `RawAction` apply path writes flags directly and fires no hook) but wasteful.
+- Same files (`HandlePacket_*`): `delete` the `GameInteractionEffect` after its synchronous `Apply()`;
+  upstream `new`-ed one per received flag packet and never freed it.
+- `soh/soh/Network/Anchor/Packets/GiveItem.cpp` (`HandlePacket_GiveItem`): `EnItem00`'s single-arrow drop
+  grants `Item_Give(ITEM_BOW)`, which `Return_Item` maps to `GI_BOW`, so one arrow arrived at teammates
+  as a vanilla Bow — a `ITEM_CATEGORY_MAJOR` "found Fairy Bow" toast per arrow, and a bow-less receiver
+  would have been granted Bow + quiver outside the seed. ComboShip is always rando (real Bow is
+  `RG_FAIRY_BOW`, `MOD_RANDOMIZER`), so a `MOD_NONE` `GI_BOW` is treated as +1 arrow when a quiver is
+  owned, dropped otherwise, never toasted.
+
+Known remaining gaps (not changed): `ITEM00_FLEXIBLE` heals via `Health_ChangeBy` and is not shared;
+direct `Rupees_ChangeBy` rewards outside `Item_Give` are not shared; while OOT is dormant,
+`PumpDormant` drops `SET_FLAG`/`UNSET_FLAG`/`SET_CHECK_STATUS` and relies on the next
+`UPDATE_TEAM_STATE` resync; MM still has no flag sync (Phase 2c).
+
+## Split-game co-op: background world sync + live partner feed (2026-11-07)
+
+**Why:** the common combo co-op shape is one player mostly in OOT and the other mostly in MM, switching
+when a game runs dry. Two gaps made that feel disconnected: (1) a client whose OOT was dormant dropped
+the teammate's `SET_FLAG`/`UNSET_FLAG`/`SET_CHECK_STATUS`/`UPDATE_DUNGEON_ITEMS`/`UPDATE_BEANS_COUNT`/
+`ENTRANCE_DISCOVERED` — only the item arrived, the world state waited for the teammate's next save
+(`UPDATE_TEAM_STATE`), so switching to OOT before that showed closed chests and allowed a double grant;
+(2) every "teammate found X" toast was suppressed for the game you are *not* in, and MM's same-game
+`GIVE_ITEM` receive never toasted at all.
+
+**Background world sync** (all `COMBO_BUILD`, no wire change):
+- `soh/soh/Network/Anchor/Anchor.cpp` (`PumpDormant`): applies those six packet types to the resident
+  save under `isDormantApply` + `isProcessingIncomingPacket` (so hooks they fire can't re-broadcast) and
+  persists via the existing `dormantDidApply` save.
+- `Packets/SetFlag.cpp` / `UnsetFlag.cpp`: a dormant branch. `GameInteractionEffect::*` refuses without
+  `gPlayState` and `RawAction::SetSceneFlag` dereferences `gPlayState->sceneNum`, so scene flags go
+  through the new `Anchor_DormantWriteSceneFlag` (save half of `RawAction::SetSceneFlag`: switch flags
+  `>= 0x20` and collectible flag 0 are temp/unsaved and skipped) and global flags through
+  `RawAction::SetFlag`/`UnsetFlag` (save-only already). The item swaps (Ruto's Letter, adult trade) use
+  `Anchor_DormantReplaceItem` = `Inventory_ReplaceItem` minus its `Interface_LoadItemIcon1(play, ...)`.
+  Both helpers are declared in `Anchor.h`. Valid because while OOT is dormant the save copy of the scene
+  flags is authoritative (`UpdateTeamState.cpp` already relies on this).
+- `Packets/SetCheckStatus.cpp`: while dormant only the status is stored; the tracker recalcs (logic
+  evaluation) are skipped and rerun on the next foreground change / file load.
+
+**Live partner feed** — new display-only packet `COMBO_PARTNER_FIND` {`itemName`, `itemGame`
+(`"oot"`/`"mm"`, the item's home game), `kind` (`"item"`/`"cross"`)}, never `addToQueue`d:
+- Sent by OOT from `SendPacket_GiveItem` (rando, non-junk, non-ice-trap) and `Anchor_BroadcastCrossItem`;
+  by MM from `MMAnchor::SendPacket_GiveItem` (non-`RITYPE_JUNK`, raw item name) and
+  `MMAnchor_BroadcastCrossItem`.
+- Both origin filters (`Anchor::OnIncomingJson`, `MMAnchor::OnIncomingJson`) let it through. Handled only
+  by the foreground game; both `PumpDormant`s drop it.
+- Shown only where no existing toast covers it. OOT: `kind=item` from MM origin, or `kind=cross` with
+  `itemGame=mm`. MM: every `kind=item` (MM's own receive is silent), or `kind=cross` with `itemGame=oot`.
+  Suffix `(MM)`/`(OoT)` marks the other game. Own `clientId` and other teams are ignored.
+
+Not covered: foreign traps are announced under their raw cross name; the dormant OOT check-tracker
+area totals refresh only once OOT is foreground again.
+
+## Partner feed: game-switch toast + feed toggles (2026-11-07)
+
+**Why:** in split play you lose track of which game your teammate is in, and the feed should be easy to
+silence.
+
+- **Game-switch toast** ("<name> is now in Majora's Mask / Ocarina of Time"), receiver-only, no wire
+  change. A peer's two games share one Anchor clientId and MM namespaces its client-state `sceneNum`
+  (`>= 1000`), so a flip across 1000 between two loaded states is a game switch.
+  - OOT: `Packets/UpdateClientState.cpp` (`HandlePacket_UpdateClientState`, compares against the stored
+    client before overwriting).
+  - MM: `MMAnchor.{h,cpp}`, new `MMAnchorClient::lastGame`, seeded in `HandlePacket_AllClientState`.
+  - Connecting never toasts (ALL_CLIENT_STATE only seeds). Self, other teams and unloaded states are
+    ignored. Only the foreground game toasts; a switch that happened while your current game was dormant
+    is announced late, on that teammate's next state.
+- **Toggles** in the combo Shared > Settings > Network panel (`combo/gui/ComboMenu.cpp`), both default on,
+  local display only: `gRemote.Anchor.PartnerFeed.Finds` (COMBO_PARTNER_FIND toasts) and
+  `gRemote.Anchor.PartnerFeed.GameSwitch`.
+
+## Co-op world sync A-M1: room seed + world settings over Anchor (2026-11-11)
+
+**Why:** "everyone in the room plays one world" (docs/plans/full-coop-sync.md, Part A) starts with
+everyone on the same seed AND the same world-shaping settings. Before this, the seed had to be passed
+around as a file and dropped at file select, nothing stopped two different seeds from syncing items and
+flags into each other's saves, MM reported `seed = 0`, and non-rando CVars that change the world (enemy
+randomizer, drop tweaks, hyper enemies…) were never compared at all, which is the reported shop, crate
+and boulder desync.
+
+**Protocol (combo-owned, `combo/coop/`, header-only, shared by launcher and DLLs):**
+- `CoopProtocol.h`: `kCoopProtocol = 1`, the `COMBO_*` packet names, and `PeerMeta`, the `state.combo`
+  object that now rides inside every `UPDATE_CLIENT_STATE.state` and `HANDSHAKE.clientState`
+  (`protocol`, `buildHash`, `layoutHash{oot,mm}`, `seedId`, `pendingSeedId`, `settingsHash`,
+  `worldCvarsHash`, `game`, `sceneId`, `roomNum`, `timeBucket`, `desyncHash`). u64s travel as 16-digit
+  hex strings. Old clients ignore the field (the packet's own header requires `contains` checks).
+- `SeedIdentity.h`: `seedId` = FNV-1a 64 over the canonical dump of the consolidated seed minus its
+  derived blocks (`playthrough`, `displaySeed`, `file_hash`) and identity fields. `settingsHash` covers
+  both games' settings and OOT tricks, `worldCvarsHash` the `worldCvars` block. Never trusted from the
+  file: always recomputed.
+- `SessionGuard.h`: pure verdicts. Progression packets (`GIVE_ITEM`, `SET_FLAG`, `UNSET_FLAG`,
+  `SET_CHECK_STATUS`, `UPDATE_TEAM_STATE`, `COMBO_CROSS_ITEM`, `UPDATE_DUNGEON_ITEMS`,
+  `UPDATE_BEANS_COUNT`, `ENTRANCE_DISCOVERED`) are dropped when both sides have a loaded save on different
+  seeds, or the protocol differs. Peers without `combo` metadata (older builds) keep the legacy behavior
+  for those. Actor/room packets (`COMBO_ACTOR_*`, `COMBO_ROOM_*`, A-M3+) additionally need both sides
+  seeded, the same seed, and the same per-game actor layout hash, and are refused for legacy peers.
+- `SeedShareCore.h` (chunking + reassembly), `CoopBase64.h`, `CoopHash.h`, `WorldCvars.h` (+ the
+  `WorldCvars{Oot,Mm}.inl` registry), `CoopUiAbi.h` (launcher ↔ comboui hooks).
+- `coop_tests` (new target, links no game DLL): hex/base64 codecs, seed identity stability, metadata
+  round-trip, every SessionGuard verdict, chunk reassembly with dropped, duplicated, out-of-order and
+  foreign chunks, and the full zlib → base64 → chunk → verify pipeline.
+
+**Launcher (`combo/ComboShip.cpp`, `combo/coop/SeedShare.{h,cpp}`, combo-owned):**
+- `ComboAnchor::Send` stamps `state.combo` on outgoing client states from either game, and sets
+  `state.seed` to the bound combo masterSeed (MM sent 0, so OOT and MM peers on one seed never matched).
+  Outgoing `UPDATE_TEAM_STATE` gets `state.comboSeedId`, because the relay replays a stored team state with
+  no sender id, so a stale save from another seed is recognized and dropped.
+- `ComboAnchor::ReceiveLoop` runs SessionGuard before forwarding (this placement replaces the plan's
+  per-DLL `OnIncomingJson` check; see the plan's Findings log). It consumes launcher-owned packets
+  (`COMBO_SEED_*`, `COMBO_WORLD_CVARS`, `COMBO_SYNC_CONFIG`) without forwarding them, and counts bytes
+  and packets per type in both directions plus every SessionGuard drop. Reads are now 64 KiB on a 1 ms
+  wait; the old loop read 512 B on a 0 ms poll and spun a core.
+- `Combo_OnReloadRequest` is split into file resolution plus `Combo_ApplySeedJson(json, mode)`, with
+  `SilentAutoLoad` / `ExplicitDrop` (unchanged behavior) and the new `RoomShare`: settings are handled like
+  SilentAutoLoad, every rando-setting key is shadowed for the session, world CVars become a session
+  overlay, and the seed file is written but not remembered.
+- Generation bakes `worldCvars` (live values of the registry) and `seedId` / `settingsHash` /
+  `worldCvarsHash` into the consolidated seed. Seeds made before this have no `worldCvars` and apply
+  nothing for that block (logged once).
+- **SeedShare** (room owner = host): offers its seed (the loaded slot's, else the one staged at file
+  select) to new team peers and on "Share my seed". A joiner that already has the seed (local index by
+  `seedId`) skips the transfer; otherwise it requests it and receives zlib + base64 chunks
+  (`targetClientId`). The seed is verified against `seedId`, written as a normal spoiler, then auto-applied
+  as RoomShare when no save is loaded (local setting `gRemote.Anchor.Coop.AutoAcceptRoomSeed`, default
+  on). A loaded save on another seed is never rebound: the guard blocks sync and comboui shows the
+  different-seed modal. Stalled transfers re-request after 10 s.
+- **World-CVar relay**: the host broadcasts its live world-CVar values (`COMBO_WORLD_CVARS`) to newcomers
+  and whenever their hash changes; joiners overlay them for the session. Leaving the room (disconnect)
+  restores the joiner's own values and unshadows everything.
+
+**`libultraship` (vendored, `COMBO_BUILD`-fenced, no lines deleted):**
+`Config::GetRaw`/`SetRaw` and `ConsoleVariable::ShadowPersist`/`UnshadowPersist`/`IsShadowed`, applied at
+the end of `ConsoleVariable::Save()`, plus C bridges `CVarShadowPersist` / `CVarUnshadowPersist` /
+`CVarIsShadowed`. A shadowed key keeps its on-disk entry (or stays absent) on every save, so a session
+overlay can never leak into `comboship.json`.
+
+**`mm/2s2h/BenPort.cpp` (vendored MM, combo export):** `MM_DumpRandoSettings` now carries the Saria's
+Song priority list (`gRando.SariaPriority`). `MM_RestoreRandoSettings` restores it (default list when
+absent) and **pre-clears every option** before applying, mirroring `SOH_RestoreRandoSettings`, so an older
+or partial snapshot reads defaults instead of inheriting this machine's values.
+
+**comboui:** `ComboWorldCvars.cpp` (dump/apply/overlay/clear; writes registry keys only, then re-runs that
+key's ShipInit funcs via `SOH_/MM_MenuApplyCVarChange`), `ComboCoopWindow.cpp` (the Co-op Sync debug window
+behind `gRemote.Anchor.Coop.Debug`, the room-seed toast and the different-seed modal; it also drives the
+launcher's idle tick, which is how leaving a room is cleaned up after the game-side pump stops), and the
+room window's room-seed line and per-peer seed, protocol, world-settings and legacy-build badges.
+
+**World-CVar registry (task 1.2):** see `combo/coop/WorldCvars{Oot,Mm}.inl` (generated from the audit;
+each entry carries a one-line note). Cheats are LOCAL by default; rando generation options are excluded
+(they already travel in the seed's `settings`).
+
+**Two-instance harness:** `scripts/coop/run-two-instances.sh` (and `.ps1`) launch two instances with
+separate `SHIP_HOME`s, preset Anchor CVars (host/room/team/name/color) and the debug window on;
+`--relay` also starts a local relay.
+
+On future merges: the libultraship shadow is a pure addition at the end of `ConsoleVariable::Save()`.
+`MM_DumpRandoSettings` / `MM_RestoreRandoSettings` are combo exports, so re-apply the Saria block and the
+pre-clear if upstream reshapes the option walk. Everything else is combo-owned.
+
+**Audit record (task 1.2):** the full classification (WORLD keys with type/default/note, excluded rando
+keys, LOCAL counts, ambiguous calls) is `docs/coop/world-cvar-audit.json`: 166 OOT and 60 MM WORLD keys,
+including all 61 concrete `RandomizedEnemyList.<Name>` keys from the enemy randomizer's spawn table.
+Judgment calls kept as WORLD: `NewDrops` (the owner's seed list; its reads look visual), MirroredWorld
+(geometry mirrors, so positions can't match), minigame tuning, world-object speeds, state-changing
+timesavers and bug fixes. Kept LOCAL but flagged for review: world-changing cheats (`FreezeTime`,
+`DropsDontDie`, `TempleTimeStop`, …), `ExtraTraps.*`, and MM time-of-day controls (these become WORLD
+if a shared room clock is ever built, plan §11 Option B).
+
+## Co-op combat: enemy/boss sync + HP scaling by player count (2026-11-13)
+
+**Why:** owner ask, "sync all enemies over Anchor and multiply enemy health by player number" (rulings: a
+synced room setting, bosses included). Every client used to simulate its own copy of every enemy. Design,
+authority model and what is owed: `docs/plans/full-coop-sync.md` §17.
+
+**Combo-owned (new):** `combo/coop/CoopEnemySync.h` (pure core, covered by `coop_tests`),
+`combo/coop/CoopEnemySyncGame.inl` (the glue, compiled into each DLL), `scripts/wombo/run2.sh` (two headless
+clients on a local relay container).
+
+**Vendored, all `COMBO_BUILD`-fenced, no lines deleted:**
+- `soh/soh/Network/Anchor/CoopEnemySync.{h,cpp}` and `mm/2s2h/Network/Anchor/CoopEnemySync.{h,cpp}` (new):
+  binders for each game's field names, Anchor object and send path.
+- `soh/soh/Network/Anchor/Anchor.cpp`: one `ProcessIncomingPacketQueue` branch, `COMBO_ACTOR_*` →
+  `CoopEnemySync_OnPacket`. `HookHandlers.cpp`: `CoopEnemySync_Init()` at the top of `RegisterHooks`
+  (registers its GameInteractor hooks once; they gate themselves on the connection).
+- `mm/2s2h/Network/Anchor/MMAnchor.{h,cpp}`: the same dispatch branch and init call, plus a public
+  `SendCoopJson` (wraps the private `SendJson`).
+- `mm/2s2h/Rando/ActorBehavior/EnemyDrops.cpp`: the `OnActorKill` drop hook returns when
+  `CoopEnemySync_IsRemoteKill()` (a teammate's copy died; ours is only removed to match), so the rando enemy
+  drop and its check exist once, in the killer's world.
+
+**Launcher / shared:** `ComboAnchor::StampCoopMeta` stamps `layoutHash{oot,mm}` = `Coop::Enemy::LayoutHash`;
+`SessionGuard.h` accepts actor packets between two unseeded saves; `WorldCvarsOot.inl` registers
+`gCombo.Coop.EnemySync` / `EnemyHpScale` / `EnemyHpPercent` (room settings via the world-CVar relay);
+`ComboMenu.cpp` adds the "Co-op Combat" block to the Network panel.
+
+On future merges: the Anchor files carry one-line seams only; if upstream reshapes either
+`ProcessIncomingPacketQueue` or `RegisterHooks`, re-add the branch and the init call. Everything else is
+combo-owned or a new file.

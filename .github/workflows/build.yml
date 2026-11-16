@@ -1,0 +1,125 @@
+name: Build (reusable)
+
+# Reusable Windows build pipeline: full Release build + cpack ZIP. Called by build-artifacts.yml
+# (which runs the `gate` job first) and release.yml (v* tags, no gate — merged code). See
+# docs/UPSTREAM_MERGES.md and CMake/CPackProjectConfig.cmake (the combo/ship/2s2h ZIP components).
+
+on:
+  workflow_call:
+    inputs:
+      # The raw cpack .zip, uploaded for release.yml to attach as a Release asset. An artifact is
+      # itself zipped on download, so this one arrives as a zip-inside-a-zip — fine for release.yml
+      # (it unwraps it) but noise on a PR, where pr-artifacts.yml would advertise it as a download.
+      release_zip:
+        type: boolean
+        default: false
+      # comborando + its runtime DLLs (~60MB). validate-seed.yml only ever fetches this from the
+      # latest successful develop run, so building/uploading it on a PR is dead weight.
+      validator:
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    # Pin to VS 2022 image — matches the "Visual Studio 17 2022" generator below (see build-windows.yml).
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Python3: Generate2ShipOtr (OTRExporter/extract_assets.py) and the asset-collision gate. soh packs
+      # with Torch (soh-o2r-packer), whose configure step fetches tinyxml2/zlib/yaml-cpp (needs network).
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Shared with the compile gate: caches the expensive vcpkg build + CMake tree.
+      - name: Cache build dir (vcpkg + CMake)
+        uses: actions/cache@v5
+        with:
+          path: build/x64
+          key: build-x64-${{ hashFiles('CMakeLists.txt', 'CMake/**', 'libultraship/cmake/**', 'torch/CMakeLists.txt') }}
+          restore-keys: build-x64-
+
+      - name: Configure
+        # See build-windows.yml: vcvars points VCPKG_ROOT at the (non-git) VS-bundled vcpkg, which
+        # breaks automate-vcpkg.cmake's git pull. Point it at the build-dir vcpkg it clones+caches.
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/build/x64/vcpkg
+        run: cmake -B build/x64 -S . -G "Visual Studio 17 2022" -A x64
+
+      # Order matters: libultraship -> soh -> 2ship (2ship builds ZAPD/OTRExporter; soh builds Torch).
+      # comboui + ComboShip pull the rest of the runtime in as dependencies.
+      - name: Build libultraship
+        run: cmake --build build/x64 --target libultraship --config Release
+      - name: Build soh
+        run: cmake --build build/x64 --target soh --config Release
+      - name: Build 2ship
+        run: cmake --build build/x64 --target 2ship --config Release
+      # Headless seed validator (pulls libultraship/soh/2ship as deps, already built above). Uploaded
+      # below so validate-seed.yml can download it from develop instead of doing its own build.
+      # Nothing else depends on it, so it is skipped unless a caller asks for the validator.
+      - name: Build comborando
+        if: inputs.validator
+        run: cmake --build build/x64 --target comborando --config Release
+      - name: Build comboui
+        run: cmake --build build/x64 --target comboui --config Release
+      - name: Build ComboShip
+        run: cmake --build build/x64 --target ComboShip --config Release
+
+      # Port asset archives (--norom). GenerateSohOtr builds Torch's soh-o2r-packer and
+      # Generate2ShipOtr builds ZAPD on demand. They must run before cpack — the ship/2s2h ZIP components install
+      # ${CMAKE_BINARY_DIR}/soh/soh.o2r and .../mm/2ship.o2r.
+      - name: Generate soh.o2r
+        run: cmake --build build/x64 --target GenerateSohOtr --config Release
+      - name: Generate 2ship.o2r
+        run: cmake --build build/x64 --target Generate2ShipOtr --config Release
+
+      # cpack -G ZIP merges the combo/ship/2s2h components into one archive under _packages/.
+      # Call cpack directly with -C Release so the multi-config generator can't package Debug by
+      # mistake (the build-tree CPackConfig.cmake carries CPACK_PROJECT_CONFIG_FILE from configure).
+      - name: Package (cpack ZIP)
+        working-directory: build/x64
+        run: cpack -G ZIP -C Release
+
+      # Extract the cpack archive before upload. GitHub always zips artifact contents on download, so
+      # uploading the .zip directly yields a zip-inside-a-zip; uploading the extracted tree makes the
+      # downloaded ComboShip-windows.zip hold the runtime files directly.
+      - name: Stage package contents
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem _packages/*.zip | Select-Object -First 1
+          Expand-Archive -Path $zip.FullName -DestinationPath _packages/stage -Force
+
+      - name: Upload ComboShip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ComboShip-windows
+          path: _packages/stage
+          if-no-files-found: error
+
+      # The raw cpack .zip (not the staged tree) for release.yml to attach directly as a Release asset.
+      - name: Upload package zip (release asset)
+        if: inputs.release_zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ComboShip-package-zip
+          path: _packages/*.zip
+          if-no-files-found: error
+
+      # comborando.exe + its deployed runtime DLLs (no o2r — the reachability oracle needs none).
+      # validate-seed.yml downloads this from the latest successful develop run instead of rebuilding.
+      - name: Upload comborando validator
+        if: inputs.validator
+        uses: actions/upload-artifact@v4
+        with:
+          name: comborando-windows
+          path: |
+            x64/Release/comborando.exe
+            x64/Release/*.dll
+          if-no-files-found: error
