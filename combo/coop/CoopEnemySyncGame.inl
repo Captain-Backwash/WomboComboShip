@@ -1332,9 +1332,10 @@ static void DsCapture(Actor* a, std::vector<uint8_t>& img, nlohmann::json& reloc
 }
 
 static bool Deflate(const std::vector<uint8_t>& in, std::vector<uint8_t>& out) {
-    uLongf n = compressBound(in.size());
+    // zlib's uLong is 32-bit on Windows; these buffers are a few KB.
+    uLongf n = compressBound((uLong)in.size());
     out.resize(n);
-    if (compress2(out.data(), &n, in.data(), in.size(), 6) != Z_OK)
+    if (compress2(out.data(), &n, in.data(), (uLong)in.size(), 6) != Z_OK)
         return false;
     out.resize(n);
     return true;
@@ -1342,8 +1343,8 @@ static bool Deflate(const std::vector<uint8_t>& in, std::vector<uint8_t>& out) {
 
 static bool Inflate(const std::vector<uint8_t>& in, size_t expect, std::vector<uint8_t>& out) {
     out.resize(expect);
-    uLongf n = expect;
-    return uncompress(out.data(), &n, in.data(), in.size()) == Z_OK && n == expect;
+    uLongf n = (uLongf)expect;
+    return uncompress(out.data(), &n, in.data(), (uLong)in.size()) == Z_OK && n == expect;
 }
 
 // Owner, at send time: one 'ds' entry for an actor we own.
