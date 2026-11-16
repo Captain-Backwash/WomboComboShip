@@ -30,7 +30,9 @@
 #include <set>
 #include <thread>
 
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <zlib.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -1132,6 +1134,25 @@ static void SpawnMirrorChild(const M::Rec& r, const Entry& e, uint64_t now) {
 //   1 = inside a synced actor instance (its key + offset), 2 = inside the owner's Link (-> its puppet on receivers),
 //   3 = inside this game library (module-relative: display lists / resource paths), stack junk past the struct -> 0.
 // An effect holding any other address (a collision poly, an object segment) is not replayed.
+#ifdef _WIN32
+// The linker's __ImageBase is this DLL's load address; SizeOfImage comes from its PE header (no windows.h, whose
+// macros collide with game code): e_lfanew at 0x3C, then PE signature (4) + file header (20) + SizeOfImage at 56.
+extern "C" char __ImageBase;
+static uintptr_t LibBase() {
+    return (uintptr_t)&__ImageBase;
+}
+
+static bool InLib(uintptr_t v) {
+    static const uintptr_t end = [] {
+        const unsigned char* b = (const unsigned char*)&__ImageBase;
+        uint32_t peOff, size;
+        std::memcpy(&peOff, b + 0x3C, 4);
+        std::memcpy(&size, b + peOff + 4 + 20 + 56, 4);
+        return (uintptr_t)b + size;
+    }();
+    return v >= LibBase() && v < end;
+}
+#else
 static uintptr_t LibBase() {
     static uintptr_t base = [] {
         Dl_info info{};
@@ -1144,6 +1165,7 @@ static bool InLib(uintptr_t v) {
     Dl_info info{};
     return LibBase() != 0 && dladdr((void*)v, &info) && (uintptr_t)info.dli_fbase == LibBase();
 }
+#endif
 
 static bool LooksLikeAddress(uint64_t v) {
     return v >= (1ull << 40) && v < (1ull << 47);

@@ -249,16 +249,22 @@ static void ComboKaleido_DrawBottleCycles() {
 }
 #endif
 
+// ComboShip (merged pause menus): is MM's own item page showing? A helper, because MSVC rejects preprocessor
+// directives inside the COND_HOOK macro's arguments.
+static bool ComboOnTerminaTab() {
+#ifdef COMBO_BUILD
+    return Combo_MmPauseTab() == COMBO_MM_PAUSE_TAB_TERMINA;
+#else
+    return true;
+#endif
+}
+
 void Rando::MiscBehavior::InitKaleidoItemPage() {
     COND_HOOK(OnKaleidoUpdate, IS_RANDO, [](PauseContext* pauseCtx) {
         InterfaceContext* interfaceCtx = &gPlayState->interfaceCtx;
 
-        if ((pauseCtx->state != PAUSE_STATE_MAIN)
-#ifdef COMBO_BUILD
-            // ComboShip (merged pause menus): the Hyrule tab is OOT's page; MM's cycling rules stay off it.
-            || ((pauseCtx->pageIndex == PAUSE_ITEM) && (Combo_MmPauseTab() != COMBO_MM_PAUSE_TAB_TERMINA))
-#endif
-        ) {
+        // ComboShip (merged pause menus): the Hyrule tab is OOT's page; MM's cycling rules stay off it.
+        if ((pauseCtx->state != PAUSE_STATE_MAIN) || ((pauseCtx->pageIndex == PAUSE_ITEM) && !ComboOnTerminaTab())) {
             sCycleActiveAnimTimer = 0;
             sCurrentItemCyclingSlot = SLOT_NONE;
             sCurrentAnimatingSlot = SLOT_NONE;
@@ -413,11 +419,9 @@ void Rando::MiscBehavior::InitKaleidoItemPage() {
     });
 
     COND_ID_HOOK(AfterKaleidoDrawPage, PAUSE_ITEM, IS_RANDO, [](PauseContext* pauseCtx, u16 pauseIndex) {
-#ifdef COMBO_BUILD
-        if (Combo_MmPauseTab() != COMBO_MM_PAUSE_TAB_TERMINA) {
+        if (!ComboOnTerminaTab()) {
             return; // ComboShip (merged pause menus): no MM cycle extras over OOT's page
         }
-#endif
         std::vector<u8> availableDeedItems = BuildAvailableItemsList(SLOT_TRADE_DEED);
         std::vector<u8> availableKeyMamaItems = BuildAvailableItemsList(SLOT_TRADE_KEY_MAMA);
         std::vector<u8> availableCoupleItems = BuildAvailableItemsList(SLOT_TRADE_COUPLE);

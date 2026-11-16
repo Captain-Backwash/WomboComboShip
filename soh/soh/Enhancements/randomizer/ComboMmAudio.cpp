@@ -41,10 +41,21 @@ extern "C" {
 #include "macros.h"
 #include "variables.h"
 #include "functions.h"
+
 extern char** sequenceMap;
 extern size_t sequenceMapSize;
 extern size_t fontMapSize;
 extern char** fontMap;
+}
+
+// strdup is POSIX; MSVC deprecates it (an error under /WX). Same behaviour everywhere.
+static char* ComboStrDup(const char* src) {
+    const size_t n = std::strlen(src) + 1;
+    char* dst = static_cast<char*>(std::malloc(n));
+    if (dst != nullptr) {
+        std::memcpy(dst, src, n);
+    }
+    return dst;
 }
 
 namespace {
@@ -214,7 +225,7 @@ int AppendSeq(const std::string& routedPath, const std::shared_ptr<Ship::IResour
     sequenceMapSize += 1;
     sequenceMap = static_cast<char**>(realloc(sequenceMap, (sequenceMapSize + 0xF) * sizeof(char*)));
     gAudioContext.seqLoadStatus = static_cast<u8*>(realloc(gAudioContext.seqLoadStatus, sequenceMapSize + 0xF));
-    sequenceMap[seqId] = strdup(routedPath.c_str());
+    sequenceMap[seqId] = ComboStrDup(routedPath.c_str());
     gAudioContext.seqLoadStatus[seqId] = 5; // as AudioLoad_Init leaves every sequence
     {
         // Build the routed copy now that the font translation is known.
@@ -362,7 +373,7 @@ void Combo_MmAudio_RegisterWithOot(void) {
     fontMap = static_cast<char**>(realloc(fontMap, newFontMapSize * sizeof(char*)));
     gAudioContext.fontLoadStatus = static_cast<u8*>(realloc(gAudioContext.fontLoadStatus, newFontMapSize));
     for (const auto& [path, ootFont] : added) {
-        fontMap[ootFont] = strdup(path.c_str());
+        fontMap[ootFont] = ComboStrDup(path.c_str());
         gAudioContext.fontLoadStatus[ootFont] = 0;
         SoundFont* sf = Combo_RoutedAudioFont(fontMap[ootFont]);
         AddFast(fontMap[ootFont], sf);
@@ -421,7 +432,7 @@ void Combo_MmAudio_RegisterWithOot(void) {
             fprintf(stderr, "[ComboShip] MM audio: MM music 0x%02X unavailable\n", kMmMusicSeqs[i]);
         }
     }
-    (void)CodecName;
+    (void)&CodecName;
 }
 
 // The OOT sequence id an MM music sequence (MM seq id) was registered as, or -1 when it is not available.

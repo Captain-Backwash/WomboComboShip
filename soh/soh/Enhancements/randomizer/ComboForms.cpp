@@ -445,7 +445,7 @@ extern "C" void Combo_OotFormDrawBall(PlayState* play, s16 shapeYaw) {
     const f32 kBinang = (f32)(M_PI / 0x8000);
 
     OPEN_DISPS(play->state.gfxCtx);
-    gSPSegment(POLY_OPA_DISP++, 0x0C, sRenderModeNone);
+    gSPSegment(POLY_OPA_DISP++, 0x0C, (uintptr_t)sRenderModeNone);
     Matrix_Push();
     Matrix_Translate(0.0f, 1200.0f * tall, 0.0f, MTXMODE_APPLY);
     if (gComboGoronBallWobble != 0) {
@@ -585,17 +585,17 @@ extern "C" void Combo_MmAnimatedMatStep(PlayState* play, const char* mmOtrPath, 
             case 0: {
                 MmScrollParams* p = (MmScrollParams*)mat->params;
                 MatSegment(play, flags, seg,
-                           Gfx_TexScrollEx(play->state.gfxCtx, p->xStep * step, -(p->yStep * step), p->width, p->height,
-                                           p->xStep, -(p->yStep)));
+                           Gfx_TexScrollEx(play->state.gfxCtx, p->xStep * step, -(s32)(p->yStep * step), p->width, p->height,
+                                           p->xStep, -(s32)(p->yStep)));
                 break;
             }
             case 1: {
                 MmScrollParams* p = (MmScrollParams*)mat->params;
                 MatSegment(play, flags, seg,
-                           Gfx_TwoTexScrollEx(play->state.gfxCtx, 0, p[0].xStep * step, -(p[0].yStep * step),
-                                              p[0].width, p[0].height, 1, p[1].xStep * step, -(p[1].yStep * step),
-                                              p[1].width, p[1].height, p[0].xStep, -(p[0].yStep), p[1].xStep,
-                                              -(p[1].yStep)));
+                           Gfx_TwoTexScrollEx(play->state.gfxCtx, 0, p[0].xStep * step, -(s32)(p[0].yStep * step),
+                                              p[0].width, p[0].height, 1, p[1].xStep * step, -(s32)(p[1].yStep * step),
+                                              p[1].width, p[1].height, p[0].xStep, -(s32)(p[0].yStep), p[1].xStep,
+                                              -(s32)(p[1].yStep)));
                 break;
             }
             case 2: {

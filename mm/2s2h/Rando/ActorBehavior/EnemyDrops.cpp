@@ -14,6 +14,15 @@ extern "C" {
 #include "overlays/actors/ovl_En_Sw/z_en_sw.h"
 }
 
+// ComboShip co-op: a helper, because MSVC rejects preprocessor directives inside the COND_HOOK macro's arguments.
+static bool ComboRemoteKill() {
+#ifdef COMBO_BUILD
+    return CoopEnemySync_IsRemoteKill();
+#else
+    return false;
+#endif
+}
+
 typedef enum {
     DROP_TYPE_NORMAL,
     DROP_TYPE_KILL,
@@ -174,13 +183,11 @@ void Rando::ActorBehavior::InitEnemyDropBehavior() {
         if (actor->id == ACTOR_EN_SW && ENSW_GET_3(actor)) {
             return;
         }
-#ifdef COMBO_BUILD
         // Co-op combat (2026-11-13): a teammate's copy of this enemy died and ours is only being removed to
         // match. The drop (and its check) belongs to the killer's world, never a second time here.
-        if (CoopEnemySync_IsRemoteKill()) {
+        if (ComboRemoteKill()) {
             return;
         }
-#endif
 
         if (actor->room == gPlayState->roomCtx.curRoom.num) { // Ignore room change actor kills
             for (auto& map : enemyDropProfiles) {

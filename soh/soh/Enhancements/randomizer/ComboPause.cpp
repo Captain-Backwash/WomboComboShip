@@ -292,10 +292,11 @@ extern "C" void Combo_PausePrismSync(int pageIndex) {
 extern "C" float Combo_PausePrismHeading(int turning, int opening, float progress) {
     if (turning) {
         float delta = (float)(sFaceTo - sFaceFrom);
-        if (delta > COMBO_PAUSE_FACE_COUNT / 2)
-            delta -= COMBO_PAUSE_FACE_COUNT;
-        if (delta < -COMBO_PAUSE_FACE_COUNT / 2)
-            delta += COMBO_PAUSE_FACE_COUNT;
+        const float faces = (float)COMBO_PAUSE_FACE_COUNT;
+        if (delta > faces / 2)
+            delta -= faces;
+        if (delta < -faces / 2)
+            delta += faces;
         return (float)sFaceFrom + delta * progress;
     }
     if (opening)
