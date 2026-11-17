@@ -838,6 +838,7 @@ static bool InjectHit(Actor* a, ActorState& st, const FwdHit& h) {
     COOP_EL_ACHITPOS(*el) = { h.hitPos[0], h.hitPos[1], h.hitPos[2] };
     a->colChkInfo.damage = (u8)h.damage;
     a->colChkInfo.damageEffect = (u8)h.damageEffect;
+    a->colChkInfo.acHitEffect = (u8)h.tEffect; // CollisionCheck_SetATvsAC copies the toucher's effect here
     st.lockUntilMs = NowMs() + kClaimLockMs * (st.boss ? 2u : 1u); // mid-fight: no proximity hand-off
     if (Trace())
         SPDLOG_INFO("[CoopEnemy] {} owner applies forwarded hit from client {}: key {} actor 0x{:X} col +0x{:X} elem {} "
@@ -968,6 +969,8 @@ static bool InjectPlayerHit(Player* pl, const PlayerHit& h) {
         COOP_EL_ACFLAGS(cel) |= kElemHit;
         cel.acHit = &sCol;
         COOP_EL_ACHITEL(cel) = &sElem;
+        // CollisionCheck_SetATvsAC: the toucher's effect picks the player's reaction (MM: 2 fire, 3 ice, 4/7 shock...).
+        pl->actor.colChkInfo.acHitEffect = (u8)h.tEffect;
         CollisionCheck_ApplyDamage(gPlayState, &gPlayState->colChkCtx, cyl, &cel); // table-less: toucher - defense
     }
     if (Trace())
@@ -1331,8 +1334,8 @@ static void DsCapture(Actor* a, std::vector<uint8_t>& img, nlohmann::json& reloc
     }
 }
 
+// zlib's uLong is 32-bit on Windows; these buffers are a few KB.
 static bool Deflate(const std::vector<uint8_t>& in, std::vector<uint8_t>& out) {
-    // zlib's uLong is 32-bit on Windows; these buffers are a few KB.
     uLongf n = compressBound((uLong)in.size());
     out.resize(n);
     if (compress2(out.data(), &n, in.data(), (uLong)in.size(), 6) != Z_OK)
@@ -1583,7 +1586,10 @@ static void OwnershipPass(uint64_t now) {
             continue;
         }
         st.orphanSinceMs = 0;
-        bool locked = (ks.last.flags & kFlagLocked) != 0;
+        // COMBO_DEBUG_COOP_NOPROX (env, harness): no proximity hand-off, so a teammate fighting next to the owner keeps
+        // hitting a mirror (forwarded hits) instead of taking the enemy over.
+        static const bool noProx = std::getenv("COMBO_DEBUG_COOP_NOPROX") != nullptr;
+        bool locked = noProx || (ks.last.flags & kFlagLocked) != 0;
         if (!locked && ProximityChallenger(DistTo(a, myPos), DistTo(a, owner->pos))) {
             if (++st.proxFrames >= kProximityTicks * 2)
                 Claim(ks, st, "nearest player");
@@ -1986,8 +1992,8 @@ static void HarnessTick(uint64_t now) {
     static const int killAt = EnvFrame("COMBO_DEBUG_COOP_KILL");
     static const int hitAt = EnvFrame("COMBO_DEBUG_COOP_HIT");
     if ((int)sFrame == nearAt) {
-        // COMBO_DEBUG_COOP_NEAR=<frame>[,<actor id hex>]: stand 70 units in front of the nearest synced enemy (of that
-        // id), facing it (then COMBO_VPAD fights for real).
+        // COMBO_DEBUG_COOP_NEAR=<frame>[,<actor id hex>[,<distance>]]: stand <distance> (default 70) units in front of
+        // the nearest synced enemy (of that id), facing it (then COMBO_VPAD fights for real).
         static const int nearId = [] {
             const char* v = std::getenv("COMBO_DEBUG_COOP_NEAR");
             const char* c = v ? std::strchr(v, ',') : nullptr;
@@ -1995,12 +2001,19 @@ static void HarnessTick(uint64_t now) {
         }();
         if (Actor* t = NearestSynced(nearId)) {
             Player* pl = GET_PLAYER(gPlayState);
+            static const float nearDist = [] { // optional 3rd field: distance (default 70)
+                const char* v = std::getenv("COMBO_DEBUG_COOP_NEAR");
+                const char* c = v ? std::strchr(v, ',') : nullptr;
+                c = c ? std::strchr(c + 1, ',') : nullptr;
+                return c ? (float)std::atof(c + 1) : 70.0f;
+            }();
             Vec3f p = t->world.pos;
-            p.z += 70.0f;
+            p.z += nearDist;
+            p.y += 100.0f; // drop onto the floor there (an enemy's y can sit below the ground at our spot: void out)
             pl->actor.world.pos = p;
             pl->actor.prevPos = p;
             pl->actor.home.pos = p;
-            pl->actor.shape.rot.y = pl->actor.world.rot.y = (s16)0x8000; // face -z, toward the enemy
+            pl->actor.shape.rot.y = pl->actor.world.rot.y = pl->yaw = (s16)0x8000; // face -z, toward the enemy
             SPDLOG_INFO("[CoopEnemy] harness: moved next to actor 0x{:X} key {}", (int)t->id,
                         Coop::HexU64(sActors[t].key));
         }

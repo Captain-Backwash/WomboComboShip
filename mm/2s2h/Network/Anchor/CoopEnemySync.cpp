@@ -72,9 +72,12 @@ static Actor* CoopG_Puppet(uint32_t clientId) {
         return nullptr;
     }
     Actor* want = &it->second.player->actor;
-    for (Actor* x = gPlayState->actorCtx.actorLists[ACTORCAT_PLAYER].first; x != nullptr; x = x->next) {
-        if (x == want && x->update != nullptr) {
-            return x;
+    // MMAnchor moves the puppet from the PLAYER list to NPC (ShouldActorInit), so look there (and PLAYER, in case).
+    for (int cat : { ACTORCAT_NPC, ACTORCAT_PLAYER }) {
+        for (Actor* x = gPlayState->actorCtx.actorLists[cat].first; x != nullptr; x = x->next) {
+            if (x == want && x->update != nullptr) {
+                return x;
+            }
         }
     }
     return nullptr;
